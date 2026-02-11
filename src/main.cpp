@@ -248,6 +248,7 @@ struct Particle {
     Transform tf;
     Vec3 vel;
     Vec3 omega;
+    Vec3 L;
     double mass = 1.0;
     double inv_mass = 1.0;
     Mat3 inertia_body;
@@ -1252,17 +1253,33 @@ static Mat3 inertia_world(const Particle& p) {
 
 static void compute_totals(const std::vector<Particle>& particles,
                            Vec3& out_p,
-                           Vec3& out_L) {
+                           Vec3& out_L,
+                           Vec3& out_L_com,
+                           Vec3& out_com) {
     Vec3 P{0.0, 0.0, 0.0};
     Vec3 L{0.0, 0.0, 0.0};
+    double msum = 0.0;
+    Vec3 com{0.0, 0.0, 0.0};
+    for (const auto& p : particles) {
+        msum += p.mass;
+        com += p.tf.pos * p.mass;
+    }
+    if (msum > 0.0) {
+        com = com / msum;
+    }
     for (const auto& p : particles) {
         P += p.vel * p.mass;
-        Mat3 Iw = inertia_world(p);
-        Vec3 Iw_omega = mat3_mul_vec3(Iw, p.omega);
-        L += cross(p.tf.pos, p.vel * p.mass) + Iw_omega;
+        L += cross(p.tf.pos, p.vel * p.mass) + p.L;
+    }
+    Vec3 Lc{0.0, 0.0, 0.0};
+    for (const auto& p : particles) {
+        Vec3 r = p.tf.pos - com;
+        Lc += cross(r, p.vel * p.mass) + p.L;
     }
     out_p = P;
     out_L = L;
+    out_L_com = Lc;
+    out_com = com;
 }
 
 static Mat3 inertia_world_inv(const Particle& p) {
@@ -1276,11 +1293,9 @@ static void integrate_particle(Particle& p, const Vec3& force, const Vec3& torqu
     p.vel += acc * dt;
     p.tf.pos += p.vel * dt;
 
-    Mat3 Iw = inertia_world(p);
     Mat3 Iinv = inertia_world_inv(p);
-    Vec3 Lw = mat3_mul_vec3(Iw, p.omega);
-    Lw += torque * dt;
-    p.omega = mat3_mul_vec3(Iinv, Lw);
+    p.L += torque * dt;
+    p.omega = mat3_mul_vec3(Iinv, p.L);
 
     Quat dq{0.0, p.omega.x, p.omega.y, p.omega.z};
     Quat qdot = quat_mul(dq, p.tf.rot);
@@ -1675,6 +1690,7 @@ int main(int argc, char** argv) {
         }
         p.radius = mesh.radius;
         p.mesh_index = mesh_index;
+        p.L = mat3_mul_vec3(inertia_world(p), p.omega);
         particles[i] = p;
     }
 
@@ -1858,26 +1874,31 @@ int main(int argc, char** argv) {
                             continue;
                         }
                         Vec3 dirAB = pb.tf.pos - pa.tf.pos;
-                        Vec3 n_use = nA;
                         if (dot(nA, dirAB) < 0.0) {
-                            n_use = nA * -1.0;
+                            std::reverse(loop_pts.begin(), loop_pts.end());
+                            acc = accumulate_Sn_Gn_from_polyline(loop_pts);
+                            Sn = acc.first;
+                            Gn = acc.second;
+                            if (!contact_point_xc0(Sn, Gn, xc0, nA, area)) {
+                                continue;
+                            }
                         }
                         Vec3 rA = xc0 - pa.tf.pos;
                         Vec3 rB = xc0 - pb.tf.pos;
                         Vec3 vA = pa.vel + cross(pa.omega, rA);
                         Vec3 vB = pb.vel + cross(pb.omega, rB);
                         Vec3 vrel = vB - vA;
-                        double vn = dot(vrel, n_use);
+                        double vn = dot(vrel, nA);
                         double fn = 0.5 * cfg.kn * area;
                         if (vn < 0.0) {
                             fn += -cfg.cn * vn;
                         }
                         if (fn < 0.0) fn = 0.0;
-                        Vec3 f = n_use * fn;
+                        Vec3 f = nA * fn;
                         forces[i] -= f;
                         forces[j] += f;
-                        torques[i] += cross(rA, f * -1.0);
-                        torques[j] += cross(rB, f);
+                        torques[i] += cross(rA, f);
+                        torques[j] += cross(rB, f * -1.0);
                         contact_counts[i] += 1;
                         contact_counts[j] += 1;
                         if (contacts == 0) {
@@ -1885,7 +1906,7 @@ int main(int argc, char** argv) {
                             Vec3 tauB = cross(rB, f);
                             std::cout << "  contact_debug: i=" << i << " j=" << j
                                       << " xc0=" << xc0.x << "," << xc0.y << "," << xc0.z
-                                      << " n=" << n_use.x << "," << n_use.y << "," << n_use.z
+                                      << " n=" << nA.x << "," << nA.y << "," << nA.z
                                       << " F=" << f.x << "," << f.y << "," << f.z
                                       << " rA=" << rA.x << "," << rA.y << "," << rA.z
                                       << " tauA=" << tauA.x << "," << tauA.y << "," << tauA.z
@@ -1913,12 +1934,17 @@ int main(int argc, char** argv) {
             t_output += std::chrono::steady_clock::now() - t_out0;
         }
         auto step_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - step_t0).count();
-        Vec3 total_P, total_L;
-        compute_totals(particles, total_P, total_L);
+        Vec3 total_P, total_L, total_Lc, com;
+        compute_totals(particles, total_P, total_L, total_Lc, com);
+        auto clean = [](double v) {
+            return (std::abs(v) < 1e-9) ? 0.0 : v;
+        };
         std::cout << "step=" << step
                   << " contacts=" << contacts
-                  << " P=" << total_P.x << "," << total_P.y << "," << total_P.z
-                  << " L=" << total_L.x << "," << total_L.y << "," << total_L.z
+                  << " P=" << clean(total_P.x) << "," << clean(total_P.y) << "," << clean(total_P.z)
+                  << " L=" << clean(total_L.x) << "," << clean(total_L.y) << "," << clean(total_L.z)
+                  << " Lc=" << clean(total_Lc.x) << "," << clean(total_Lc.y) << "," << clean(total_Lc.z)
+                  << " COM=" << clean(com.x) << "," << clean(com.y) << "," << clean(com.z)
                   << "\n";
         if (step % 50 == 0 || step_ms >= 2000) {
             auto tri_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_tri).count();
