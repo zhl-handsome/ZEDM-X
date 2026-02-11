@@ -1251,36 +1251,6 @@ static Mat3 inertia_world(const Particle& p) {
     return mat3_mul(mat3_mul(R, p.inertia_body), Rt);
 }
 
-static void compute_totals(const std::vector<Particle>& particles,
-                           Vec3& out_p,
-                           Vec3& out_L,
-                           Vec3& out_L_com,
-                           Vec3& out_com) {
-    Vec3 P{0.0, 0.0, 0.0};
-    Vec3 L{0.0, 0.0, 0.0};
-    double msum = 0.0;
-    Vec3 com{0.0, 0.0, 0.0};
-    for (const auto& p : particles) {
-        msum += p.mass;
-        com += p.tf.pos * p.mass;
-    }
-    if (msum > 0.0) {
-        com = com / msum;
-    }
-    for (const auto& p : particles) {
-        P += p.vel * p.mass;
-        L += cross(p.tf.pos, p.vel * p.mass) + p.L;
-    }
-    Vec3 Lc{0.0, 0.0, 0.0};
-    for (const auto& p : particles) {
-        Vec3 r = p.tf.pos - com;
-        Lc += cross(r, p.vel * p.mass) + p.L;
-    }
-    out_p = P;
-    out_L = L;
-    out_L_com = Lc;
-    out_com = com;
-}
 
 static Mat3 inertia_world_inv(const Particle& p) {
     Mat3 R = quat_to_mat3(p.tf.rot);
@@ -1316,6 +1286,7 @@ struct SimConfig {
     Vec3 gravity{0.0, -9.81, 0.0};
     bool split_contacts = true;
     bool center_mesh = true;
+    bool contact_debug = false;
     std::string stl_path;
     std::string vtk_prefix = "particles";
     int output_interval = 1;
@@ -1405,6 +1376,10 @@ static bool parse_config_file(const std::string& path, SimConfig& cfg) {
             int v = 1;
             iss >> v;
             cfg.split_contacts = (v != 0);
+        } else if (key == "contact_debug") {
+            int v = 0;
+            iss >> v;
+            cfg.contact_debug = (v != 0);
         } else if (key == "gravity") {
             iss >> cfg.gravity.x >> cfg.gravity.y >> cfg.gravity.z;
         } else if (key == "center_mesh") {
@@ -1583,6 +1558,32 @@ static void write_vtk_particles(const std::string& path,
                 << static_cast<float>(p.tf.rot.y) << " "
                 << static_cast<float>(p.tf.rot.z) << "\n";
         }
+    }
+}
+
+static void write_particle_state_txt(const std::string& path,
+                                     const std::vector<Particle>& particles,
+                                     const std::vector<Mesh>& meshes,
+                                     const std::vector<ParticleInit>& inits) {
+    std::ofstream out(path);
+    if (!out) {
+        std::cerr << "Failed to write particle state: " << path << "\n";
+        return;
+    }
+    out.setf(std::ios::fixed);
+    out << std::setprecision(9);
+    for (std::size_t i = 0; i < particles.size(); ++i) {
+        const Particle& p = particles[i];
+        const ParticleInit& init = inits[i];
+        out << "particle\n";
+        out << "stl = " << (init.stl_path.empty() ? "" : init.stl_path) << "\n";
+        out << "pos = " << p.tf.pos.x << " " << p.tf.pos.y << " " << p.tf.pos.z << "\n";
+        out << "vel = " << p.vel.x << " " << p.vel.y << " " << p.vel.z << "\n";
+        out << "quat = " << p.tf.rot.w << " " << p.tf.rot.x << " " << p.tf.rot.y << " " << p.tf.rot.z << "\n";
+        out << "omega = " << p.omega.x << " " << p.omega.y << " " << p.omega.z << "\n";
+        out << "scale = " << init.scale << "\n";
+        out << "density = " << init.density << "\n";
+        out << "end_particle\n\n";
     }
 }
 
@@ -1875,13 +1876,14 @@ int main(int argc, char** argv) {
                         }
                         Vec3 dirAB = pb.tf.pos - pa.tf.pos;
                         if (dot(nA, dirAB) < 0.0) {
-                            std::reverse(loop_pts.begin(), loop_pts.end());
-                            acc = accumulate_Sn_Gn_from_polyline(loop_pts);
-                            Sn = acc.first;
-                            Gn = acc.second;
-                            if (!contact_point_xc0(Sn, Gn, xc0, nA, area)) {
-                                continue;
-                            }
+                            // std::reverse(loop_pts.begin(), loop_pts.end());
+                            // acc = accumulate_Sn_Gn_from_polyline(loop_pts);
+                            // Sn = acc.first;
+                            // Gn = acc.second;
+                            // if (!contact_point_xc0(Sn, Gn, xc0, nA, area)) {
+                            //     continue;
+                            // }
+                            nA = nA * -1.0;
                         }
                         Vec3 rA = xc0 - pa.tf.pos;
                         Vec3 rB = xc0 - pb.tf.pos;
@@ -1901,9 +1903,9 @@ int main(int argc, char** argv) {
                         torques[j] += cross(rB, f * -1.0);
                         contact_counts[i] += 1;
                         contact_counts[j] += 1;
-                        if (contacts == 0) {
-                            Vec3 tauA = cross(rA, f * -1.0);
-                            Vec3 tauB = cross(rB, f);
+                        if (cfg.contact_debug && contacts == 0) {
+                            Vec3 tauA = cross(rA, f);
+                            Vec3 tauB = cross(rB, f * -1.0);
                             std::cout << "  contact_debug: i=" << i << " j=" << j
                                       << " xc0=" << xc0.x << "," << xc0.y << "," << xc0.z
                                       << " n=" << nA.x << "," << nA.y << "," << nA.z
@@ -1932,33 +1934,22 @@ int main(int argc, char** argv) {
             auto t_out0 = std::chrono::steady_clock::now();
             write_vtk_particles(out_path.string(), meshes, particles, forces, torques, contact_counts);
             t_output += std::chrono::steady_clock::now() - t_out0;
-        }
-        auto step_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - step_t0).count();
-        Vec3 total_P, total_L, total_Lc, com;
-        compute_totals(particles, total_P, total_L, total_Lc, com);
-        auto clean = [](double v) {
-            return (std::abs(v) < 1e-9) ? 0.0 : v;
-        };
-        std::cout << "step=" << step
-                  << " contacts=" << contacts
-                  << " P=" << clean(total_P.x) << "," << clean(total_P.y) << "," << clean(total_P.z)
-                  << " L=" << clean(total_L.x) << "," << clean(total_L.y) << "," << clean(total_L.z)
-                  << " Lc=" << clean(total_Lc.x) << "," << clean(total_Lc.y) << "," << clean(total_Lc.z)
-                  << " COM=" << clean(com.x) << "," << clean(com.y) << "," << clean(com.z)
-                  << "\n";
-        if (step % 50 == 0 || step_ms >= 2000) {
+
+            auto step_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - step_t0).count();
             auto tri_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_tri).count();
             auto rebuild_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_rebuild).count();
             auto out_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_output).count();
-            std::cout << "  profile: step_ms=" << step_ms
-                      << " tri_ms=" << tri_ms
-                      << " rebuild_ms=" << rebuild_ms
-                      << " output_ms=" << out_ms
-                      << " tri_checks=" << tri_checks
-                      << " segments=" << total_segments
-                      << " comps=" << total_comps
-                      << " loops=" << total_loops
-                      << "\n";
+            std::cout << "step=" << step
+                  << " contacts=" << contacts
+                  << " step_ms=" << step_ms
+                  << " tri_ms=" << tri_ms
+                  << " rebuild_ms=" << rebuild_ms
+                  << " output_ms=" << out_ms
+                  << " tri_checks=" << tri_checks
+                  << " segments=" << total_segments
+                  << " comps=" << total_comps
+                  << " loops=" << total_loops
+                  << "\n";
         }
     }
 

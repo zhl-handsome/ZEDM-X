@@ -68,6 +68,7 @@ dt = 0.001
 kn = 100000
 cn = 50
 split_contacts = 1
+contact_debug = 0
 gravity = 0 0 0
 center_mesh = 1
 vtk_prefix = particles
