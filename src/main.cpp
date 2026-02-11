@@ -13,6 +13,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 struct Vec3 {
@@ -242,6 +243,10 @@ struct ParticleInit {
     Quat rot{1.0, 0.0, 0.0, 0.0};
     double scale = 0.0;
     double density = 1.0;
+    double young = 1e7;
+    double poisson = 0.25;
+    double mu = 0.5;
+    double restitution = 0.5;
 };
 
 struct Particle {
@@ -254,6 +259,11 @@ struct Particle {
     Mat3 inertia_body;
     Mat3 inertia_body_inv;
     double radius = 0.0;
+    double equiv_radius = 0.0;
+    double young = 0.0;
+    double poisson = 0.0;
+    double mu = 0.0;
+    double restitution = 0.0;
     int mesh_index = 0;
 };
 
@@ -1281,8 +1291,6 @@ struct SimConfig {
     int steps = 1;
     double dt = 1e-4;
     double spacing = 2.5;
-    double kn = 1e5;
-    double cn = 0.0;
     Vec3 gravity{0.0, -9.81, 0.0};
     bool split_contacts = true;
     bool center_mesh = true;
@@ -1357,6 +1365,14 @@ static bool parse_config_file(const std::string& path, SimConfig& cfg) {
                 iss >> current.scale;
             } else if (key == "density") {
                 iss >> current.density;
+            } else if (key == "young") {
+                iss >> current.young;
+            } else if (key == "poisson") {
+                iss >> current.poisson;
+            } else if (key == "mu") {
+                iss >> current.mu;
+            } else if (key == "restitution") {
+                iss >> current.restitution;
             }
         } else if (key == "stl") {
             iss >> cfg.stl_path;
@@ -1368,10 +1384,6 @@ static bool parse_config_file(const std::string& path, SimConfig& cfg) {
             iss >> cfg.dt;
         } else if (key == "spacing") {
             iss >> cfg.spacing;
-        } else if (key == "kn") {
-            iss >> cfg.kn;
-        } else if (key == "cn") {
-            iss >> cfg.cn;
         } else if (key == "split_contacts") {
             int v = 1;
             iss >> v;
@@ -1583,6 +1595,10 @@ static void write_particle_state_txt(const std::string& path,
         out << "omega = " << p.omega.x << " " << p.omega.y << " " << p.omega.z << "\n";
         out << "scale = " << init.scale << "\n";
         out << "density = " << init.density << "\n";
+        out << "young = " << init.young << "\n";
+        out << "poisson = " << init.poisson << "\n";
+        out << "mu = " << init.mu << "\n";
+        out << "restitution = " << init.restitution << "\n";
         out << "end_particle\n\n";
     }
 }
@@ -1644,6 +1660,10 @@ int main(int argc, char** argv) {
             inits[i].omega = Vec3{0.0, 0.0, 0.0};
             inits[i].scale = 1.0;
             inits[i].density = 1.0;
+            inits[i].young = 1e7;
+            inits[i].poisson = 0.25;
+            inits[i].mu = 0.5;
+            inits[i].restitution = 0.5;
         }
     }
 
@@ -1690,6 +1710,11 @@ int main(int argc, char** argv) {
             p.inertia_body_inv = mat3_inverse(Ibody);
         }
         p.radius = mesh.radius;
+        p.equiv_radius = mesh.volume > 0.0 ? std::cbrt(3.0 * mesh.volume / (4.0 * 3.141592653589793)) : mesh.radius;
+        p.young = init.young;
+        p.poisson = init.poisson;
+        p.mu = init.mu;
+        p.restitution = init.restitution;
         p.mesh_index = mesh_index;
         p.L = mat3_mul_vec3(inertia_world(p), p.omega);
         particles[i] = p;
@@ -1698,6 +1723,7 @@ int main(int argc, char** argv) {
     std::vector<Vec3> forces(particles.size());
     std::vector<Vec3> torques(particles.size());
     std::vector<int> contact_counts(particles.size());
+    std::unordered_map<long long, Vec3> tangential_disp;
 
     std::filesystem::create_directories(cfg.output_dir);
 
@@ -1708,6 +1734,7 @@ int main(int argc, char** argv) {
         std::fill(contact_counts.begin(), contact_counts.end(), 0);
 
         int contacts = 0;
+        std::unordered_set<long long> active_pairs;
         std::size_t total_segments = 0;
         std::size_t total_loops = 0;
         std::size_t total_comps = 0;
@@ -1719,6 +1746,7 @@ int main(int argc, char** argv) {
         for (int j = i + 1; j < static_cast<int>(particles.size()); ++j) {
                 Particle& pa = particles[i];
                 Particle& pb = particles[j];
+                long long pair_key = (static_cast<long long>(i) << 32) | static_cast<unsigned long long>(j);
                 Vec3 dpos = pb.tf.pos - pa.tf.pos;
                 double dist2 = dot(dpos, dpos);
                 double rsum = pa.radius + pb.radius;
@@ -1891,16 +1919,71 @@ int main(int argc, char** argv) {
                         Vec3 vB = pb.vel + cross(pb.omega, rB);
                         Vec3 vrel = vB - vA;
                         double vn = dot(vrel, nA);
-                        double fn = 0.5 * cfg.kn * area;
+
+                        double R1 = std::max(pa.equiv_radius, 1e-12);
+                        double R2 = std::max(pb.equiv_radius, 1e-12);
+                        double E1 = std::max(pa.young, 1e-12);
+                        double E2 = std::max(pb.young, 1e-12);
+                        double nu1 = pa.poisson;
+                        double nu2 = pb.poisson;
+                        double A_n = area;
+                        double kn = (E1 / R1 + E2 / R2) * A_n;
+                        double kt = (E1 / (2.0 * (1.0 + nu1) * R1) + E2 / (2.0 * (1.0 + nu2) * R2)) * A_n;
+                        double m_eff = 1.0 / (pa.inv_mass + pb.inv_mass);
+                        double e = std::min(pa.restitution, pb.restitution);
+                        e = std::min(0.9999, std::max(1e-6, e));
+                        double loge = std::log(e);
+                        double cn = 2.0 * loge * std::sqrt(kn * m_eff) / std::sqrt(loge * loge + 3.141592653589793 * 3.141592653589793);
+                        double ct = 2.0 * loge * std::sqrt(kt * m_eff) / std::sqrt(loge * loge + 3.141592653589793 * 3.141592653589793);
+                        cn = std::abs(cn);
+                        ct = std::abs(ct);
+
+                        double maxA = -std::numeric_limits<double>::infinity();
+                        double minB = std::numeric_limits<double>::infinity();
+                        for (const auto& tri : trisA) {
+                            maxA = std::max(maxA, dot(nA, tri[0]));
+                            maxA = std::max(maxA, dot(nA, tri[1]));
+                            maxA = std::max(maxA, dot(nA, tri[2]));
+                        }
+                        for (const auto& tri : trisB) {
+                            minB = std::min(minB, dot(nA, tri[0]));
+                            minB = std::min(minB, dot(nA, tri[1]));
+                            minB = std::min(minB, dot(nA, tri[2]));
+                        }
+                        double depth = maxA - minB;
+                        if (depth <= 0.0) {
+                            continue;
+                        }
+                        double deltaV = A_n * depth;
+                        double fn = kn * std::cbrt(deltaV);
                         if (vn < 0.0) {
-                            fn += -cfg.cn * vn;
+                            fn += -cn * vn;
                         }
                         if (fn < 0.0) fn = 0.0;
-                        Vec3 f = nA * fn;
+                        Vec3 fn_vec = nA * fn;
+
+                        Vec3 vt = vrel - nA * vn;
+                        Vec3 ds = tangential_disp[pair_key];
+                        ds += vt * cfg.dt;
+                        ds -= nA * dot(ds, nA);
+                        Vec3 ft = ds * (-kt) + vt * (-ct);
+                        double mu = std::min(pa.mu, pb.mu);
+                        double ft_norm = norm(ft);
+                        double ft_max = mu * fn;
+                        if (ft_norm > ft_max && ft_norm > 1e-14) {
+                            ft = ft * (ft_max / ft_norm);
+                            if (kt > 1e-12) {
+                                ds = ft * (-1.0 / kt);
+                            }
+                        }
+                        tangential_disp[pair_key] = ds;
+
+                        Vec3 f = fn_vec + ft;
                         forces[i] -= f;
                         forces[j] += f;
                         torques[i] += cross(rA, f);
                         torques[j] += cross(rB, f * -1.0);
+                        active_pairs.insert(pair_key);
                         contact_counts[i] += 1;
                         contact_counts[j] += 1;
                         if (cfg.contact_debug && contacts == 0) {
@@ -1925,6 +2008,14 @@ int main(int argc, char** argv) {
 
         for (int i = 0; i < static_cast<int>(particles.size()); ++i) {
             integrate_particle(particles[i], forces[i], torques[i], cfg.gravity, cfg.dt);
+        }
+
+        for (auto it = tangential_disp.begin(); it != tangential_disp.end(); ) {
+            if (active_pairs.find(it->first) == active_pairs.end()) {
+                it = tangential_disp.erase(it);
+            } else {
+                ++it;
+            }
         }
 
         if (step % cfg.output_interval == 0) {

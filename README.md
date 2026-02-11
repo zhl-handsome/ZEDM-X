@@ -65,8 +65,6 @@ build/Debug/zdem_cpu --config config/example_sim.txt
 ```text
 steps = 1000
 dt = 0.001
-kn = 100000
-cn = 50
 split_contacts = 1
 contact_debug = 0
 gravity = 0 0 0
@@ -83,6 +81,10 @@ quat = 1 0 0 0
 omega = 0 0 0
 scale = 0.001
 density = 2500
+young = 1e7
+poisson = 0.25
+mu = 0.5
+restitution = 0.5
 end_particle
 
 particle
@@ -93,6 +95,10 @@ quat = 1 0 0 0
 omega = 0 0 0
 scale = 0.001
 density = 2500
+young = 1e7
+poisson = 0.25
+mu = 0.5
+restitution = 0.5
 end_particle
 ```
 
