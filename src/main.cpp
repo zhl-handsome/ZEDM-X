@@ -161,6 +161,15 @@ struct Mesh {
     double bbox_diag = 0.0;
 };
 
+struct ParticleInit {
+    std::string stl_path;
+    Vec3 pos{0.0, 0.0, 0.0};
+    Vec3 vel{0.0, 0.0, 0.0};
+    Vec3 omega{0.0, 0.0, 0.0};
+    Quat rot{1.0, 0.0, 0.0, 0.0};
+    double scale = 0.0;
+};
+
 struct Particle {
     Transform tf;
     Vec3 vel;
@@ -170,6 +179,7 @@ struct Particle {
     Vec3 inertia_body;
     Vec3 inertia_body_inv;
     double radius = 0.0;
+    int mesh_index = 0;
 };
 
 static std::vector<Vec3> unique_vertices(const std::vector<std::array<Vec3, 3>>& tris) {
@@ -1133,7 +1143,6 @@ struct SimConfig {
     double cn = 0.0;
     double mass = 1.0;
     Vec3 gravity{0.0, -9.81, 0.0};
-    double mesh_scale = 0.001;
     bool split_contacts = true;
     bool center_mesh = true;
     std::string stl_path;
@@ -1142,6 +1151,7 @@ struct SimConfig {
     std::string output_dir = "output";
     Vec3 v0{0.0, 0.0, 0.0};
     Vec3 v1{0.0, 0.0, 0.0};
+    std::vector<ParticleInit> particle_inits;
 };
 
 static bool parse_config_file(const std::string& path, SimConfig& cfg) {
@@ -1151,6 +1161,8 @@ static bool parse_config_file(const std::string& path, SimConfig& cfg) {
         return false;
     }
     std::string line;
+    bool in_particle = false;
+    ParticleInit current;
     while (std::getline(in, line)) {
         if (line.empty()) {
             continue;
@@ -1172,7 +1184,37 @@ static bool parse_config_file(const std::string& path, SimConfig& cfg) {
         if (!(iss >> key)) {
             continue;
         }
-        if (key == "stl") {
+        if (key == "particle") {
+            if (in_particle) {
+                cfg.particle_inits.push_back(current);
+            }
+            current = ParticleInit{};
+            in_particle = true;
+            continue;
+        }
+        if (key == "end_particle" || key == "particle_end") {
+            if (in_particle) {
+                cfg.particle_inits.push_back(current);
+                in_particle = false;
+            }
+            continue;
+        }
+
+        if (in_particle) {
+            if (key == "stl") {
+                iss >> current.stl_path;
+            } else if (key == "pos") {
+                iss >> current.pos.x >> current.pos.y >> current.pos.z;
+            } else if (key == "vel") {
+                iss >> current.vel.x >> current.vel.y >> current.vel.z;
+            } else if (key == "omega") {
+                iss >> current.omega.x >> current.omega.y >> current.omega.z;
+            } else if (key == "quat") {
+                iss >> current.rot.w >> current.rot.x >> current.rot.y >> current.rot.z;
+            } else if (key == "scale") {
+                iss >> current.scale;
+            }
+        } else if (key == "stl") {
             iss >> cfg.stl_path;
         } else if (key == "n") {
             iss >> cfg.n;
@@ -1188,8 +1230,6 @@ static bool parse_config_file(const std::string& path, SimConfig& cfg) {
             iss >> cfg.cn;
         } else if (key == "mass") {
             iss >> cfg.mass;
-        } else if (key == "mesh_scale") {
-            iss >> cfg.mesh_scale;
         } else if (key == "split_contacts") {
             int v = 1;
             iss >> v;
@@ -1212,10 +1252,16 @@ static bool parse_config_file(const std::string& path, SimConfig& cfg) {
             iss >> cfg.v1.x >> cfg.v1.y >> cfg.v1.z;
         }
     }
+    if (in_particle) {
+        cfg.particle_inits.push_back(current);
+    }
     if (cfg.output_interval < 1) {
         cfg.output_interval = 1;
     }
-    return !cfg.stl_path.empty();
+    if (!cfg.stl_path.empty()) {
+        return true;
+    }
+    return !cfg.particle_inits.empty();
 }
 
 static bool parse_args(int argc, char** argv, std::string& config_path) {
@@ -1238,7 +1284,7 @@ static void usage() {
 }
 
 static void write_vtk_particles(const std::string& path,
-                                const Mesh& mesh,
+                                const std::vector<Mesh>& meshes,
                                 const std::vector<Particle>& particles,
                                 const std::vector<Vec3>& forces,
                                 const std::vector<Vec3>& torques,
@@ -1252,12 +1298,15 @@ static void write_vtk_particles(const std::string& path,
     out << "zdem particles\n";
     out << "ASCII\n";
     out << "DATASET POLYDATA\n";
-    const std::size_t tris_per_particle = mesh.tris.size();
-    const std::size_t total_tris = tris_per_particle * particles.size();
+    std::size_t total_tris = 0;
+    for (const auto& p : particles) {
+        total_tris += meshes[p.mesh_index].tris.size();
+    }
     const std::size_t total_points = total_tris * 3;
     out << "POINTS " << total_points << " float\n";
     for (const auto& p : particles) {
-        for (const auto& tri : mesh.tris) {
+        const auto& m = meshes[p.mesh_index];
+        for (const auto& tri : m.tris) {
             Vec3 v0 = quat_rotate(p.tf.rot, tri[0]) + p.tf.pos;
             Vec3 v1 = quat_rotate(p.tf.rot, tri[1]) + p.tf.pos;
             Vec3 v2 = quat_rotate(p.tf.rot, tri[2]) + p.tf.pos;
@@ -1278,6 +1327,7 @@ static void write_vtk_particles(const std::string& path,
     out << "SCALARS id int 1\n";
     out << "LOOKUP_TABLE default\n";
     for (int i = 0; i < static_cast<int>(particles.size()); ++i) {
+        std::size_t tris_per_particle = meshes[particles[i].mesh_index].tris.size();
         for (std::size_t t = 0; t < tris_per_particle; ++t) {
             out << i << "\n";
         }
@@ -1286,6 +1336,7 @@ static void write_vtk_particles(const std::string& path,
     out << "SCALARS mass float 1\n";
     out << "LOOKUP_TABLE default\n";
     for (const auto& p : particles) {
+        std::size_t tris_per_particle = meshes[p.mesh_index].tris.size();
         for (std::size_t t = 0; t < tris_per_particle; ++t) {
             out << static_cast<float>(p.mass) << "\n";
         }
@@ -1294,6 +1345,7 @@ static void write_vtk_particles(const std::string& path,
     out << "SCALARS radius float 1\n";
     out << "LOOKUP_TABLE default\n";
     for (const auto& p : particles) {
+        std::size_t tris_per_particle = meshes[p.mesh_index].tris.size();
         for (std::size_t t = 0; t < tris_per_particle; ++t) {
             out << static_cast<float>(p.radius) << "\n";
         }
@@ -1301,14 +1353,16 @@ static void write_vtk_particles(const std::string& path,
 
     out << "SCALARS contact_count int 1\n";
     out << "LOOKUP_TABLE default\n";
-    for (int c : contact_counts) {
+    for (std::size_t i = 0; i < contact_counts.size(); ++i) {
+        std::size_t tris_per_particle = meshes[particles[i].mesh_index].tris.size();
         for (std::size_t t = 0; t < tris_per_particle; ++t) {
-            out << c << "\n";
+            out << contact_counts[i] << "\n";
         }
     }
 
     out << "VECTORS velocity float\n";
     for (const auto& p : particles) {
+        std::size_t tris_per_particle = meshes[p.mesh_index].tris.size();
         for (std::size_t t = 0; t < tris_per_particle; ++t) {
             out << static_cast<float>(p.vel.x) << " "
                 << static_cast<float>(p.vel.y) << " "
@@ -1318,6 +1372,7 @@ static void write_vtk_particles(const std::string& path,
 
     out << "VECTORS omega float\n";
     for (const auto& p : particles) {
+        std::size_t tris_per_particle = meshes[p.mesh_index].tris.size();
         for (std::size_t t = 0; t < tris_per_particle; ++t) {
             out << static_cast<float>(p.omega.x) << " "
                 << static_cast<float>(p.omega.y) << " "
@@ -1327,6 +1382,7 @@ static void write_vtk_particles(const std::string& path,
 
     out << "VECTORS force float\n";
     for (std::size_t i = 0; i < particles.size(); ++i) {
+        std::size_t tris_per_particle = meshes[particles[i].mesh_index].tris.size();
         for (std::size_t t = 0; t < tris_per_particle; ++t) {
             const Vec3& f = forces[i];
             out << static_cast<float>(f.x) << " "
@@ -1337,6 +1393,7 @@ static void write_vtk_particles(const std::string& path,
 
     out << "VECTORS torque float\n";
     for (std::size_t i = 0; i < particles.size(); ++i) {
+        std::size_t tris_per_particle = meshes[particles[i].mesh_index].tris.size();
         for (std::size_t t = 0; t < tris_per_particle; ++t) {
             const Vec3& tt = torques[i];
             out << static_cast<float>(tt.x) << " "
@@ -1348,6 +1405,7 @@ static void write_vtk_particles(const std::string& path,
     out << "FIELD FieldData 1\n";
     out << "orientation 4 " << total_tris << " float\n";
     for (const auto& p : particles) {
+        std::size_t tris_per_particle = meshes[p.mesh_index].tris.size();
         for (std::size_t t = 0; t < tris_per_particle; ++t) {
             out << static_cast<float>(p.tf.rot.w) << " "
                 << static_cast<float>(p.tf.rot.x) << " "
@@ -1368,50 +1426,91 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::vector<std::array<Vec3, 3>> tris;
-    if (!load_stl(cfg.stl_path, tris)) {
-        std::cerr << "Failed to load STL: " << cfg.stl_path << "\n";
-        return 1;
+    std::unordered_map<std::string, std::vector<std::array<Vec3, 3>>> tri_cache;
+    std::unordered_map<std::string, int> mesh_cache;
+    std::vector<Mesh> meshes;
+
+    auto load_mesh_for = [&](const std::string& path, double scale) -> int {
+        std::string key = path + "|" + std::to_string(scale);
+        auto it_cache = mesh_cache.find(key);
+        if (it_cache != mesh_cache.end()) {
+            return it_cache->second;
+        }
+
+        auto it = tri_cache.find(path);
+        if (it == tri_cache.end()) {
+            std::vector<std::array<Vec3, 3>> tris;
+            if (!load_stl(path, tris)) {
+                return -1;
+            }
+            tri_cache[path] = tris;
+            it = tri_cache.find(path);
+        }
+        std::vector<std::array<Vec3, 3>> tris = it->second;
+        for (auto& tri : tris) {
+            tri[0] *= scale;
+            tri[1] *= scale;
+            tri[2] *= scale;
+        }
+        Mesh m = build_mesh(tris, cfg.center_mesh);
+        meshes.push_back(m);
+        int idx = static_cast<int>(meshes.size() - 1);
+        mesh_cache[key] = idx;
+        return idx;
+    };
+
+    std::vector<ParticleInit> inits;
+    if (!cfg.particle_inits.empty()) {
+        inits = cfg.particle_inits;
+    } else {
+        inits.resize(cfg.n);
+        for (int i = 0; i < cfg.n; ++i) {
+            inits[i].stl_path = cfg.stl_path;
+            inits[i].pos = Vec3{cfg.spacing * i, 0.0, 0.0};
+            inits[i].vel = (i == 0) ? cfg.v0 : (i == 1 ? cfg.v1 : Vec3{0.0, 0.0, 0.0});
+            inits[i].rot = Quat{};
+            inits[i].omega = Vec3{0.0, 0.0, 0.0};
+            inits[i].scale = 1.0;
+        }
     }
 
-    for (auto& tri : tris) {
-        tri[0] *= cfg.mesh_scale;
-        tri[1] *= cfg.mesh_scale;
-        tri[2] *= cfg.mesh_scale;
-    }
-
-    Mesh mesh = build_mesh(tris, cfg.center_mesh);
-    if (mesh.vertices.empty()) {
-        std::cerr << "Mesh has no vertices.\n";
-        return 1;
-    }
-
-    std::vector<Particle> particles(cfg.n);
-    for (int i = 0; i < cfg.n; ++i) {
+    std::vector<Particle> particles(inits.size());
+    for (std::size_t i = 0; i < inits.size(); ++i) {
+        const auto& init = inits[i];
+        std::string stl_path = init.stl_path.empty() ? cfg.stl_path : init.stl_path;
+        if (stl_path.empty()) {
+            std::cerr << "Missing stl for particle " << i << "\n";
+            return 1;
+        }
+        double scale = init.scale > 0.0 ? init.scale : 1.0;
+        int mesh_index = load_mesh_for(stl_path, scale);
+        if (mesh_index < 0) {
+            std::cerr << "Failed to load STL: " << stl_path << "\n";
+            return 1;
+        }
+        const Mesh& mesh = meshes[mesh_index];
+        if (mesh.vertices.empty()) {
+            std::cerr << "Mesh has no vertices.\n";
+            return 1;
+        }
         Particle p;
-        p.tf.pos = Vec3{cfg.spacing * i, 0.0, 0.0};
-        p.tf.rot = Quat{};
-        p.vel = Vec3{0.0, 0.0, 0.0};
-        p.omega = Vec3{0.0, 0.0, 0.0};
+        p.tf.pos = init.pos;
+        p.tf.rot = init.rot;
+        p.vel = init.vel;
+        p.omega = init.omega;
         p.mass = cfg.mass;
         p.inv_mass = 1.0 / cfg.mass;
         double I = 0.4 * p.mass * mesh.radius * mesh.radius;
         p.inertia_body = Vec3{I, I, I};
         p.inertia_body_inv = Vec3{1.0 / I, 1.0 / I, 1.0 / I};
         p.radius = mesh.radius;
+        p.mesh_index = mesh_index;
         particles[i] = p;
     }
 
-    if (cfg.n >= 1) {
-        particles[0].vel = cfg.v0;
-    }
-    if (cfg.n >= 2) {
-        particles[1].vel = cfg.v1;
-    }
-
-    std::vector<Vec3> forces(cfg.n);
-    std::vector<Vec3> torques(cfg.n);
-    std::vector<int> contact_counts(cfg.n);
+    std::vector<Vec3> forces(particles.size());
+    std::vector<Vec3> torques(particles.size());
+    std::vector<int> contact_counts(particles.size());
 
     std::filesystem::create_directories(cfg.output_dir);
 
@@ -1429,8 +1528,8 @@ int main(int argc, char** argv) {
         auto t_tri = std::chrono::steady_clock::duration::zero();
         auto t_rebuild = std::chrono::steady_clock::duration::zero();
         auto t_output = std::chrono::steady_clock::duration::zero();
-        for (int i = 0; i < cfg.n; ++i) {
-            for (int j = i + 1; j < cfg.n; ++j) {
+    for (int i = 0; i < static_cast<int>(particles.size()); ++i) {
+        for (int j = i + 1; j < static_cast<int>(particles.size()); ++j) {
                 Particle& pa = particles[i];
                 Particle& pb = particles[j];
                 Vec3 dpos = pb.tf.pos - pa.tf.pos;
@@ -1441,8 +1540,10 @@ int main(int argc, char** argv) {
                 }
 
                 auto t0 = std::chrono::steady_clock::now();
-                std::vector<std::array<Vec3, 3>> trisA = transform_tris(mesh, pa.tf);
-                std::vector<std::array<Vec3, 3>> trisB = transform_tris(mesh, pb.tf);
+                const Mesh& meshA = meshes[pa.mesh_index];
+                const Mesh& meshB = meshes[pb.mesh_index];
+                std::vector<std::array<Vec3, 3>> trisA = transform_tris(meshA, pa.tf);
+                std::vector<std::array<Vec3, 3>> trisB = transform_tris(meshB, pb.tf);
 
                 std::vector<Vec3> nA_all(trisA.size());
                 std::vector<Vec3> nB_all(trisB.size());
@@ -1495,7 +1596,7 @@ int main(int argc, char** argv) {
                     aabbB_max[tb] = mx;
                 }
 
-                double tol = mesh.mean_edge > 0.0 ? (mesh.mean_edge * 0.1) : (mesh.bbox_diag * 1e-2);
+                double tol = meshA.mean_edge > 0.0 ? (meshA.mean_edge * 0.1) : (meshA.bbox_diag * 1e-2);
                 if (tol <= 0.0) {
                     tol = 1e-6;
                 }
@@ -1582,13 +1683,24 @@ int main(int argc, char** argv) {
                         if (!contact_point_xc0(Sn, Gn, xc0, nA, area)) {
                             continue;
                         }
+                        double area_eps = meshA.mean_edge > 0.0 ? (meshA.mean_edge * meshA.mean_edge * 1e-4) : 1e-12;
+                        if (area < area_eps) {
+                            continue;
+                        }
+                        Vec3 dirAB = pb.tf.pos - pa.tf.pos;
+                        if (dot(nA, dirAB) < 0.0) {
+                            nA = nA * -1.0;
+                        }
                         Vec3 rA = xc0 - pa.tf.pos;
                         Vec3 rB = xc0 - pb.tf.pos;
                         Vec3 vA = pa.vel + cross(pa.omega, rA);
                         Vec3 vB = pb.vel + cross(pb.omega, rB);
                         Vec3 vrel = vB - vA;
                         double vn = dot(vrel, nA);
-                        double fn = 0.5 * cfg.kn * area - cfg.cn * vn;
+                        double fn = 0.5 * cfg.kn * area;
+                        if (vn < 0.0) {
+                            fn += -cfg.cn * vn;
+                        }
                         if (fn < 0.0) fn = 0.0;
                         Vec3 f = nA * fn;
                         forces[i] -= f;
@@ -1604,7 +1716,7 @@ int main(int argc, char** argv) {
             }
         }
 
-        for (int i = 0; i < cfg.n; ++i) {
+        for (int i = 0; i < static_cast<int>(particles.size()); ++i) {
             integrate_particle(particles[i], forces[i], torques[i], cfg.gravity, cfg.dt);
         }
 
@@ -1613,7 +1725,7 @@ int main(int argc, char** argv) {
             oss << cfg.vtk_prefix << "_" << std::setw(6) << std::setfill('0') << step << ".vtk";
             std::filesystem::path out_path = std::filesystem::path(cfg.output_dir) / oss.str();
             auto t_out0 = std::chrono::steady_clock::now();
-            write_vtk_particles(out_path.string(), mesh, particles, forces, torques, contact_counts);
+            write_vtk_particles(out_path.string(), meshes, particles, forces, torques, contact_counts);
             t_output += std::chrono::steady_clock::now() - t_out0;
         }
         auto step_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - step_t0).count();

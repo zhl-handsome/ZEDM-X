@@ -63,23 +63,35 @@ build/Debug/zdem_cpu --config config/example_sim.txt
 说明：`tol` 不再作为参数，程序会基于网格平均边长自动估计容差。
 
 ```text
-stl = geometry/low-poly-banbana.stl
-n = 2
-steps = 10
+steps = 1000
 dt = 0.001
-spacing = 1.5
 kn = 100000
 cn = 50
 mass = 1.0
-mesh_scale = 0.001
 split_contacts = 1
-gravity = 0 -9.81 0
+gravity = 0 0 0
 center_mesh = 1
 vtk_prefix = particles
 output_dir = output
-output_interval = 1
-v0 = 1 0 0
-v1 = -1 0 0
+output_interval = 10
+
+particle
+stl = geometry/low-poly-banbana.stl
+pos = 0 0 0
+vel = 1 0 0
+quat = 1 0 0 0
+omega = 0 0 0
+scale = 0.001
+end_particle
+
+particle
+stl = geometry/low-poly-banbana.stl
+pos = 1.5 0 0
+vel = -1 0 0
+quat = 1 0 0 0
+omega = 0 0 0
+scale = 0.001
+end_particle
 ```
 
 ### 完整参数

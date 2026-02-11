@@ -35,6 +35,7 @@ env/
 *.swp
 *.swo
 *~
+.sisyphus
 
 # Output files
 *.vtk
