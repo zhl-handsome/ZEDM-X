@@ -67,7 +67,6 @@ steps = 1000
 dt = 0.001
 kn = 100000
 cn = 50
-mass = 1.0
 split_contacts = 1
 gravity = 0 0 0
 center_mesh = 1
@@ -82,6 +81,7 @@ vel = 1 0 0
 quat = 1 0 0 0
 omega = 0 0 0
 scale = 0.001
+density = 2500
 end_particle
 
 particle
@@ -91,6 +91,7 @@ vel = -1 0 0
 quat = 1 0 0 0
 omega = 0 0 0
 scale = 0.001
+density = 2500
 end_particle
 ```
 

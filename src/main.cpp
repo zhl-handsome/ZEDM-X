@@ -100,6 +100,52 @@ struct Mat3 {
     double m[3][3] = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}};
 };
 
+static inline Mat3 mat3_identity() {
+    Mat3 r;
+    r.m[0][0] = 1.0;
+    r.m[1][1] = 1.0;
+    r.m[2][2] = 1.0;
+    return r;
+}
+
+static inline Mat3 mat3_add(const Mat3& a, const Mat3& b) {
+    Mat3 r;
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            r.m[i][j] = a.m[i][j] + b.m[i][j];
+        }
+    }
+    return r;
+}
+
+static inline Mat3 mat3_sub(const Mat3& a, const Mat3& b) {
+    Mat3 r;
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            r.m[i][j] = a.m[i][j] - b.m[i][j];
+        }
+    }
+    return r;
+}
+
+static inline Mat3 mat3_scale(const Mat3& a, double s) {
+    Mat3 r;
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            r.m[i][j] = a.m[i][j] * s;
+        }
+    }
+    return r;
+}
+
+static inline Mat3 mat3_outer(const Vec3& a, const Vec3& b) {
+    Mat3 r;
+    r.m[0][0] = a.x * b.x; r.m[0][1] = a.x * b.y; r.m[0][2] = a.x * b.z;
+    r.m[1][0] = a.y * b.x; r.m[1][1] = a.y * b.y; r.m[1][2] = a.y * b.z;
+    r.m[2][0] = a.z * b.x; r.m[2][1] = a.z * b.y; r.m[2][2] = a.z * b.z;
+    return r;
+}
+
 static inline Mat3 quat_to_mat3(const Quat& q) {
     Quat n = quat_normalize(q);
     double w = n.w, x = n.x, y = n.y, z = n.z;
@@ -147,6 +193,31 @@ static inline Mat3 mat3_transpose(const Mat3& m) {
     return r;
 }
 
+static inline double mat3_det(const Mat3& a) {
+    return a.m[0][0] * (a.m[1][1] * a.m[2][2] - a.m[1][2] * a.m[2][1])
+         - a.m[0][1] * (a.m[1][0] * a.m[2][2] - a.m[1][2] * a.m[2][0])
+         + a.m[0][2] * (a.m[1][0] * a.m[2][1] - a.m[1][1] * a.m[2][0]);
+}
+
+static inline Mat3 mat3_inverse(const Mat3& a) {
+    double det = mat3_det(a);
+    if (std::abs(det) < 1e-18) {
+        return mat3_identity();
+    }
+    double invdet = 1.0 / det;
+    Mat3 r;
+    r.m[0][0] =  (a.m[1][1] * a.m[2][2] - a.m[1][2] * a.m[2][1]) * invdet;
+    r.m[0][1] = -(a.m[0][1] * a.m[2][2] - a.m[0][2] * a.m[2][1]) * invdet;
+    r.m[0][2] =  (a.m[0][1] * a.m[1][2] - a.m[0][2] * a.m[1][1]) * invdet;
+    r.m[1][0] = -(a.m[1][0] * a.m[2][2] - a.m[1][2] * a.m[2][0]) * invdet;
+    r.m[1][1] =  (a.m[0][0] * a.m[2][2] - a.m[0][2] * a.m[2][0]) * invdet;
+    r.m[1][2] = -(a.m[0][0] * a.m[1][2] - a.m[0][2] * a.m[1][0]) * invdet;
+    r.m[2][0] =  (a.m[1][0] * a.m[2][1] - a.m[1][1] * a.m[2][0]) * invdet;
+    r.m[2][1] = -(a.m[0][0] * a.m[2][1] - a.m[0][1] * a.m[2][0]) * invdet;
+    r.m[2][2] =  (a.m[0][0] * a.m[1][1] - a.m[0][1] * a.m[1][0]) * invdet;
+    return r;
+}
+
 struct Transform {
     Vec3 pos;
     Quat rot;
@@ -159,6 +230,8 @@ struct Mesh {
     double radius = 0.0;
     double mean_edge = 0.0;
     double bbox_diag = 0.0;
+    double volume = 0.0;
+    Mat3 inertia_unit;
 };
 
 struct ParticleInit {
@@ -168,6 +241,7 @@ struct ParticleInit {
     Vec3 omega{0.0, 0.0, 0.0};
     Quat rot{1.0, 0.0, 0.0, 0.0};
     double scale = 0.0;
+    double density = 1.0;
 };
 
 struct Particle {
@@ -176,8 +250,8 @@ struct Particle {
     Vec3 omega;
     double mass = 1.0;
     double inv_mass = 1.0;
-    Vec3 inertia_body;
-    Vec3 inertia_body_inv;
+    Mat3 inertia_body;
+    Mat3 inertia_body_inv;
     double radius = 0.0;
     int mesh_index = 0;
 };
@@ -268,29 +342,103 @@ static bool load_stl(const std::string& path, std::vector<std::array<Vec3, 3>>& 
     return !tris.empty();
 }
 
+static void compute_mass_properties(const std::vector<std::array<Vec3, 3>>& tris,
+                                    double& out_volume,
+                                    Vec3& out_centroid,
+                                    Mat3& out_inertia) {
+    double det_sum = 0.0;
+    Vec3 csum{0.0, 0.0, 0.0};
+    double Ixx = 0.0, Iyy = 0.0, Izz = 0.0;
+    double Ixy = 0.0, Ixz = 0.0, Iyz = 0.0;
+
+    for (const auto& tri : tris) {
+        Vec3 a = tri[0];
+        Vec3 b = tri[1];
+        Vec3 c = tri[2];
+        double det = dot(a, cross(b, c));
+        det_sum += det;
+        csum += (a + b + c) * det;
+
+        double x1 = a.x, x2 = b.x, x3 = c.x;
+        double y1 = a.y, y2 = b.y, y3 = c.y;
+        double z1 = a.z, z2 = b.z, z3 = c.z;
+
+        double f2x = x1 * x1 + x2 * x2 + x3 * x3 + x1 * x2 + x1 * x3 + x2 * x3;
+        double f2y = y1 * y1 + y2 * y2 + y3 * y3 + y1 * y2 + y1 * y3 + y2 * y3;
+        double f2z = z1 * z1 + z2 * z2 + z3 * z3 + z1 * z2 + z1 * z3 + z2 * z3;
+
+        Ixx += det * (f2y + f2z);
+        Iyy += det * (f2x + f2z);
+        Izz += det * (f2x + f2y);
+
+        double gxy = 2.0 * x1 * y1 + 2.0 * x2 * y2 + 2.0 * x3 * y3
+                   + x1 * y2 + x2 * y1 + x1 * y3 + x3 * y1 + x2 * y3 + x3 * y2;
+        double gxz = 2.0 * x1 * z1 + 2.0 * x2 * z2 + 2.0 * x3 * z3
+                   + x1 * z2 + x2 * z1 + x1 * z3 + x3 * z1 + x2 * z3 + x3 * z2;
+        double gyz = 2.0 * y1 * z1 + 2.0 * y2 * z2 + 2.0 * y3 * z3
+                   + y1 * z2 + y2 * z1 + y1 * z3 + y3 * z1 + y2 * z3 + y3 * z2;
+        Ixy += det * gxy;
+        Ixz += det * gxz;
+        Iyz += det * gyz;
+    }
+
+    if (std::abs(det_sum) < 1e-18) {
+        out_volume = 0.0;
+        out_centroid = Vec3{0.0, 0.0, 0.0};
+        out_inertia = Mat3{};
+        return;
+    }
+
+    if (det_sum < 0.0) {
+        det_sum = -det_sum;
+        csum *= -1.0;
+        Ixx *= -1.0; Iyy *= -1.0; Izz *= -1.0;
+        Ixy *= -1.0; Ixz *= -1.0; Iyz *= -1.0;
+    }
+
+    out_volume = det_sum / 6.0;
+    out_centroid = csum / (4.0 * det_sum);
+
+    Ixx /= 60.0;
+    Iyy /= 60.0;
+    Izz /= 60.0;
+    Ixy /= -120.0;
+    Ixz /= -120.0;
+    Iyz /= -120.0;
+
+    Mat3 I;
+    I.m[0][0] = Ixx; I.m[1][1] = Iyy; I.m[2][2] = Izz;
+    I.m[0][1] = Ixy; I.m[1][0] = Ixy;
+    I.m[0][2] = Ixz; I.m[2][0] = Ixz;
+    I.m[1][2] = Iyz; I.m[2][1] = Iyz;
+    out_inertia = I;
+}
+
 static Mesh build_mesh(const std::vector<std::array<Vec3, 3>>& tris, bool center_mesh) {
     Mesh m;
     m.vertices = unique_vertices(tris);
     m.tris = tris;
-    Vec3 center{0.0, 0.0, 0.0};
-    for (const auto& v : m.vertices) {
-        center += v;
+    Vec3 centroid{0.0, 0.0, 0.0};
+    Mat3 inertia_origin;
+    compute_mass_properties(m.tris, m.volume, centroid, inertia_origin);
+    m.center = centroid;
+    Mat3 inertia_cm = inertia_origin;
+    if (m.volume > 0.0) {
+        Mat3 shift = mat3_sub(mat3_scale(mat3_identity(), dot(centroid, centroid)), mat3_outer(centroid, centroid));
+        inertia_cm = mat3_sub(inertia_origin, mat3_scale(shift, m.volume));
     }
-    if (!m.vertices.empty()) {
-        center *= (1.0 / static_cast<double>(m.vertices.size()));
-    }
-    m.center = center;
     if (center_mesh) {
         for (auto& v : m.vertices) {
-            v -= center;
+            v -= centroid;
         }
         for (auto& tri : m.tris) {
-            tri[0] -= center;
-            tri[1] -= center;
-            tri[2] -= center;
+            tri[0] -= centroid;
+            tri[1] -= centroid;
+            tri[2] -= centroid;
         }
         m.center = Vec3{0.0, 0.0, 0.0};
     }
+    m.inertia_unit = inertia_cm;
     double r2 = 0.0;
     Vec3 mn{std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity()};
     Vec3 mx{-std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity()};
@@ -1099,21 +1247,28 @@ static bool epa_penetration(const Mesh& a, const Transform& ta,
 static Mat3 inertia_world(const Particle& p) {
     Mat3 R = quat_to_mat3(p.tf.rot);
     Mat3 Rt = mat3_transpose(R);
-    Mat3 Ibody;
-    Ibody.m[0][0] = p.inertia_body.x;
-    Ibody.m[1][1] = p.inertia_body.y;
-    Ibody.m[2][2] = p.inertia_body.z;
-    return mat3_mul(mat3_mul(R, Ibody), Rt);
+    return mat3_mul(mat3_mul(R, p.inertia_body), Rt);
+}
+
+static void compute_totals(const std::vector<Particle>& particles,
+                           Vec3& out_p,
+                           Vec3& out_L) {
+    Vec3 P{0.0, 0.0, 0.0};
+    Vec3 L{0.0, 0.0, 0.0};
+    for (const auto& p : particles) {
+        P += p.vel * p.mass;
+        Mat3 Iw = inertia_world(p);
+        Vec3 Iw_omega = mat3_mul_vec3(Iw, p.omega);
+        L += cross(p.tf.pos, p.vel * p.mass) + Iw_omega;
+    }
+    out_p = P;
+    out_L = L;
 }
 
 static Mat3 inertia_world_inv(const Particle& p) {
     Mat3 R = quat_to_mat3(p.tf.rot);
     Mat3 Rt = mat3_transpose(R);
-    Mat3 Iinv;
-    Iinv.m[0][0] = p.inertia_body_inv.x;
-    Iinv.m[1][1] = p.inertia_body_inv.y;
-    Iinv.m[2][2] = p.inertia_body_inv.z;
-    return mat3_mul(mat3_mul(R, Iinv), Rt);
+    return mat3_mul(mat3_mul(R, p.inertia_body_inv), Rt);
 }
 
 static void integrate_particle(Particle& p, const Vec3& force, const Vec3& torque, const Vec3& gravity, double dt) {
@@ -1121,9 +1276,11 @@ static void integrate_particle(Particle& p, const Vec3& force, const Vec3& torqu
     p.vel += acc * dt;
     p.tf.pos += p.vel * dt;
 
+    Mat3 Iw = inertia_world(p);
     Mat3 Iinv = inertia_world_inv(p);
-    Vec3 ang_acc = mat3_mul_vec3(Iinv, torque);
-    p.omega += ang_acc * dt;
+    Vec3 Lw = mat3_mul_vec3(Iw, p.omega);
+    Lw += torque * dt;
+    p.omega = mat3_mul_vec3(Iinv, Lw);
 
     Quat dq{0.0, p.omega.x, p.omega.y, p.omega.z};
     Quat qdot = quat_mul(dq, p.tf.rot);
@@ -1141,7 +1298,6 @@ struct SimConfig {
     double spacing = 2.5;
     double kn = 1e5;
     double cn = 0.0;
-    double mass = 1.0;
     Vec3 gravity{0.0, -9.81, 0.0};
     bool split_contacts = true;
     bool center_mesh = true;
@@ -1213,6 +1369,8 @@ static bool parse_config_file(const std::string& path, SimConfig& cfg) {
                 iss >> current.rot.w >> current.rot.x >> current.rot.y >> current.rot.z;
             } else if (key == "scale") {
                 iss >> current.scale;
+            } else if (key == "density") {
+                iss >> current.density;
             }
         } else if (key == "stl") {
             iss >> cfg.stl_path;
@@ -1228,8 +1386,6 @@ static bool parse_config_file(const std::string& path, SimConfig& cfg) {
             iss >> cfg.kn;
         } else if (key == "cn") {
             iss >> cfg.cn;
-        } else if (key == "mass") {
-            iss >> cfg.mass;
         } else if (key == "split_contacts") {
             int v = 1;
             iss >> v;
@@ -1471,6 +1627,7 @@ int main(int argc, char** argv) {
             inits[i].rot = Quat{};
             inits[i].omega = Vec3{0.0, 0.0, 0.0};
             inits[i].scale = 1.0;
+            inits[i].density = 1.0;
         }
     }
 
@@ -1498,11 +1655,24 @@ int main(int argc, char** argv) {
         p.tf.rot = init.rot;
         p.vel = init.vel;
         p.omega = init.omega;
-        p.mass = cfg.mass;
-        p.inv_mass = 1.0 / cfg.mass;
-        double I = 0.4 * p.mass * mesh.radius * mesh.radius;
-        p.inertia_body = Vec3{I, I, I};
-        p.inertia_body_inv = Vec3{1.0 / I, 1.0 / I, 1.0 / I};
+        if (mesh.volume > 0.0) {
+            double density = init.density > 0.0 ? init.density : 1.0;
+            p.mass = density * mesh.volume;
+            p.inv_mass = 1.0 / p.mass;
+            p.inertia_body = mat3_scale(mesh.inertia_unit, density);
+            p.inertia_body_inv = mat3_inverse(p.inertia_body);
+        } else {
+            double density = init.density > 0.0 ? init.density : 1.0;
+            p.mass = density;
+            p.inv_mass = 1.0 / p.mass;
+            double I = 0.4 * p.mass * mesh.radius * mesh.radius;
+            Mat3 Ibody = mat3_identity();
+            Ibody.m[0][0] = I;
+            Ibody.m[1][1] = I;
+            Ibody.m[2][2] = I;
+            p.inertia_body = Ibody;
+            p.inertia_body_inv = mat3_inverse(Ibody);
+        }
         p.radius = mesh.radius;
         p.mesh_index = mesh_index;
         particles[i] = p;
@@ -1688,27 +1858,41 @@ int main(int argc, char** argv) {
                             continue;
                         }
                         Vec3 dirAB = pb.tf.pos - pa.tf.pos;
+                        Vec3 n_use = nA;
                         if (dot(nA, dirAB) < 0.0) {
-                            nA = nA * -1.0;
+                            n_use = nA * -1.0;
                         }
                         Vec3 rA = xc0 - pa.tf.pos;
                         Vec3 rB = xc0 - pb.tf.pos;
                         Vec3 vA = pa.vel + cross(pa.omega, rA);
                         Vec3 vB = pb.vel + cross(pb.omega, rB);
                         Vec3 vrel = vB - vA;
-                        double vn = dot(vrel, nA);
+                        double vn = dot(vrel, n_use);
                         double fn = 0.5 * cfg.kn * area;
                         if (vn < 0.0) {
                             fn += -cfg.cn * vn;
                         }
                         if (fn < 0.0) fn = 0.0;
-                        Vec3 f = nA * fn;
+                        Vec3 f = n_use * fn;
                         forces[i] -= f;
                         forces[j] += f;
                         torques[i] += cross(rA, f * -1.0);
                         torques[j] += cross(rB, f);
                         contact_counts[i] += 1;
                         contact_counts[j] += 1;
+                        if (contacts == 0) {
+                            Vec3 tauA = cross(rA, f * -1.0);
+                            Vec3 tauB = cross(rB, f);
+                            std::cout << "  contact_debug: i=" << i << " j=" << j
+                                      << " xc0=" << xc0.x << "," << xc0.y << "," << xc0.z
+                                      << " n=" << n_use.x << "," << n_use.y << "," << n_use.z
+                                      << " F=" << f.x << "," << f.y << "," << f.z
+                                      << " rA=" << rA.x << "," << rA.y << "," << rA.z
+                                      << " tauA=" << tauA.x << "," << tauA.y << "," << tauA.z
+                                      << " rB=" << rB.x << "," << rB.y << "," << rB.z
+                                      << " tauB=" << tauB.x << "," << tauB.y << "," << tauB.z
+                                      << "\n";
+                        }
                         contacts++;
                     }
                 }
@@ -1729,7 +1913,13 @@ int main(int argc, char** argv) {
             t_output += std::chrono::steady_clock::now() - t_out0;
         }
         auto step_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - step_t0).count();
-        std::cout << "step=" << step << " contacts=" << contacts << "\n";
+        Vec3 total_P, total_L;
+        compute_totals(particles, total_P, total_L);
+        std::cout << "step=" << step
+                  << " contacts=" << contacts
+                  << " P=" << total_P.x << "," << total_P.y << "," << total_P.z
+                  << " L=" << total_L.x << "," << total_L.y << "," << total_L.z
+                  << "\n";
         if (step % 50 == 0 || step_ms >= 2000) {
             auto tri_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_tri).count();
             auto rebuild_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_rebuild).count();
