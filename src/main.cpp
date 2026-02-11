@@ -4,12 +4,15 @@
 #include <cstdint>
 #include <cctype>
 #include <fstream>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <random>
+#include <chrono>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 struct Vec3 {
@@ -52,6 +55,10 @@ static inline Vec3 normalize(const Vec3& v) {
         return Vec3{0.0, 0.0, 0.0};
     }
     return v / n;
+}
+
+static inline double norm2(const Vec3& v) {
+    return dot(v, v);
 }
 
 struct Quat {
@@ -147,8 +154,11 @@ struct Transform {
 
 struct Mesh {
     std::vector<Vec3> vertices;
+    std::vector<std::array<Vec3, 3>> tris;
     Vec3 center;
     double radius = 0.0;
+    double mean_edge = 0.0;
+    double bbox_diag = 0.0;
 };
 
 struct Particle {
@@ -251,6 +261,7 @@ static bool load_stl(const std::string& path, std::vector<std::array<Vec3, 3>>& 
 static Mesh build_mesh(const std::vector<std::array<Vec3, 3>>& tris, bool center_mesh) {
     Mesh m;
     m.vertices = unique_vertices(tris);
+    m.tris = tris;
     Vec3 center{0.0, 0.0, 0.0};
     for (const auto& v : m.vertices) {
         center += v;
@@ -263,14 +274,595 @@ static Mesh build_mesh(const std::vector<std::array<Vec3, 3>>& tris, bool center
         for (auto& v : m.vertices) {
             v -= center;
         }
+        for (auto& tri : m.tris) {
+            tri[0] -= center;
+            tri[1] -= center;
+            tri[2] -= center;
+        }
         m.center = Vec3{0.0, 0.0, 0.0};
     }
     double r2 = 0.0;
+    Vec3 mn{std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity()};
+    Vec3 mx{-std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity()};
     for (const auto& v : m.vertices) {
         r2 = std::max(r2, dot(v, v));
+        mn.x = std::min(mn.x, v.x);
+        mn.y = std::min(mn.y, v.y);
+        mn.z = std::min(mn.z, v.z);
+        mx.x = std::max(mx.x, v.x);
+        mx.y = std::max(mx.y, v.y);
+        mx.z = std::max(mx.z, v.z);
     }
     m.radius = std::sqrt(r2);
+    m.bbox_diag = norm(mx - mn);
+
+    double edge_sum = 0.0;
+    std::size_t edge_cnt = 0;
+    for (const auto& tri : m.tris) {
+        edge_sum += norm(tri[1] - tri[0]);
+        edge_sum += norm(tri[2] - tri[1]);
+        edge_sum += norm(tri[0] - tri[2]);
+        edge_cnt += 3;
+    }
+    if (edge_cnt > 0) {
+        m.mean_edge = edge_sum / static_cast<double>(edge_cnt);
+    }
     return m;
+}
+
+static std::vector<std::array<Vec3, 3>> transform_tris(const Mesh& mesh, const Transform& tf) {
+    std::vector<std::array<Vec3, 3>> out;
+    out.reserve(mesh.tris.size());
+    for (const auto& tri : mesh.tris) {
+        std::array<Vec3, 3> t;
+        t[0] = quat_rotate(tf.rot, tri[0]) + tf.pos;
+        t[1] = quat_rotate(tf.rot, tri[1]) + tf.pos;
+        t[2] = quat_rotate(tf.rot, tri[2]) + tf.pos;
+        out.push_back(t);
+    }
+    return out;
+}
+
+static Vec3 tri_normal(const std::array<Vec3, 3>& tri) {
+    Vec3 e1 = tri[1] - tri[0];
+    Vec3 e2 = tri[2] - tri[0];
+    return normalize(cross(e1, e2));
+}
+
+static bool plane_from_tri(const std::array<Vec3, 3>& tri, Vec3& n, double& d) {
+    n = cross(tri[1] - tri[0], tri[2] - tri[0]);
+    double ln = norm(n);
+    if (ln < 1e-30) {
+        return false;
+    }
+    n = n / ln;
+    d = -dot(n, tri[0]);
+    return true;
+}
+
+static bool point_in_tri(const Vec3& p, const std::array<Vec3, 3>& tri, const Vec3& n) {
+    Vec3 a = tri[0];
+    Vec3 b = tri[1];
+    Vec3 c = tri[2];
+    Vec3 ab = b - a;
+    Vec3 bc = c - b;
+    Vec3 ca = a - c;
+    Vec3 ap = p - a;
+    Vec3 bp = p - b;
+    Vec3 cp = p - c;
+    double c1 = dot(cross(ab, ap), n);
+    double c2 = dot(cross(bc, bp), n);
+    double c3 = dot(cross(ca, cp), n);
+    return (c1 >= -1e-10) && (c2 >= -1e-10) && (c3 >= -1e-10);
+}
+
+static bool seg_plane_intersection(const Vec3& p0, const Vec3& p1, const Vec3& n, double d, Vec3& out) {
+    Vec3 u = p1 - p0;
+    double denom = dot(n, u);
+    double num = -(dot(n, p0) + d);
+    if (std::abs(denom) < 1e-30) {
+        return false;
+    }
+    double t = num / denom;
+    if (t < -1e-10 || t > 1.0 + 1e-10) {
+        return false;
+    }
+    t = std::min(1.0, std::max(0.0, t));
+    out = p0 + u * t;
+    return true;
+}
+
+static std::vector<Vec3> unique_points(const std::vector<Vec3>& pts, double tol) {
+    std::vector<Vec3> out;
+    double tol2 = tol * tol;
+    for (const auto& p : pts) {
+        bool keep = true;
+        for (const auto& q : out) {
+            if (norm2(p - q) <= tol2) {
+                keep = false;
+                break;
+            }
+        }
+        if (keep) {
+            out.push_back(p);
+        }
+    }
+    return out;
+}
+
+static bool tri_tri_intersection_segment(const std::array<Vec3, 3>& triA, const Vec3& nA, double dA,
+                                         const std::array<Vec3, 3>& triB, const Vec3& nB, double dB,
+                                         Vec3& out_p0, Vec3& out_p1) {
+    Vec3 tau = cross(nA, nB);
+    double lt = norm(tau);
+    if (lt < 1e-20) {
+        return false;
+    }
+    tau = tau / lt;
+
+    std::vector<Vec3> candidates;
+    for (int i = 0; i < 3; ++i) {
+        int j = (i + 1) % 3;
+        Vec3 p;
+        if (seg_plane_intersection(triA[i], triA[j], nB, dB, p) && point_in_tri(p, triB, nB)) {
+            candidates.push_back(p);
+        }
+    }
+    for (int i = 0; i < 3; ++i) {
+        int j = (i + 1) % 3;
+        Vec3 p;
+        if (seg_plane_intersection(triB[i], triB[j], nA, dA, p) && point_in_tri(p, triA, nA)) {
+            candidates.push_back(p);
+        }
+    }
+
+    candidates = unique_points(candidates, 1e-9);
+    if (candidates.size() < 2) {
+        return false;
+    }
+    double min_t = std::numeric_limits<double>::infinity();
+    double max_t = -std::numeric_limits<double>::infinity();
+    int i0 = -1, i1 = -1;
+    for (int i = 0; i < static_cast<int>(candidates.size()); ++i) {
+        double t = dot(candidates[i], tau);
+        if (t < min_t) { min_t = t; i0 = i; }
+        if (t > max_t) { max_t = t; i1 = i; }
+    }
+    if (i0 == i1) {
+        return false;
+    }
+    Vec3 p0 = candidates[i0];
+    Vec3 p1 = candidates[i1];
+    if (norm2(p1 - p0) < 1e-18) {
+        return false;
+    }
+    if (dot(p1 - p0, tau) < 0.0) {
+        std::swap(p0, p1);
+    }
+    out_p0 = p0;
+    out_p1 = p1;
+    return true;
+}
+
+struct Int3 {
+    int x = 0;
+    int y = 0;
+    int z = 0;
+    bool operator==(const Int3& o) const { return x == o.x && y == o.y && z == o.z; }
+};
+
+struct Int3Hash {
+    std::size_t operator()(const Int3& k) const {
+        std::size_t h1 = std::hash<int>{}(k.x);
+        std::size_t h2 = std::hash<int>{}(k.y);
+        std::size_t h3 = std::hash<int>{}(k.z);
+        return h1 ^ (h2 << 1) ^ (h3 << 2);
+    }
+};
+
+static Int3 cell_index(const Vec3& p, double h) {
+    return Int3{
+        static_cast<int>(std::floor(p.x / h)),
+        static_cast<int>(std::floor(p.y / h)),
+        static_cast<int>(std::floor(p.z / h))
+    };
+}
+
+struct UnionFind {
+    std::vector<int> parent;
+    std::vector<int> rank;
+
+    explicit UnionFind(int n = 0) : parent(n), rank(n, 0) {
+        for (int i = 0; i < n; ++i) parent[i] = i;
+    }
+
+    int find(int x) {
+        if (parent[x] != x) parent[x] = find(parent[x]);
+        return parent[x];
+    }
+
+    void unite(int a, int b) {
+        int ra = find(a);
+        int rb = find(b);
+        if (ra == rb) return;
+        if (rank[ra] < rank[rb]) parent[ra] = rb;
+        else if (rank[ra] > rank[rb]) parent[rb] = ra;
+        else { parent[rb] = ra; rank[ra] += 1; }
+    }
+};
+
+static void snap_endpoints(const std::vector<std::pair<Vec3, Vec3>>& segments,
+                           double tol,
+                           std::vector<Vec3>& out_vertices,
+                           std::vector<std::pair<int, int>>& out_edges) {
+    double h = tol;
+    int nseg = static_cast<int>(segments.size());
+    std::vector<Vec3> pts(2 * nseg);
+    for (int i = 0; i < nseg; ++i) {
+        pts[2 * i] = segments[i].first;
+        pts[2 * i + 1] = segments[i].second;
+    }
+
+    UnionFind uf(2 * nseg);
+    std::unordered_map<Int3, std::vector<int>, Int3Hash> grid;
+
+    for (int i = 0; i < 2 * nseg; ++i) {
+        const Vec3& p = pts[i];
+        Int3 c = cell_index(p, h);
+        for (int dx = -1; dx <= 1; ++dx) {
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dz = -1; dz <= 1; ++dz) {
+                    Int3 cc{c.x + dx, c.y + dy, c.z + dz};
+                    auto it = grid.find(cc);
+                    if (it == grid.end()) continue;
+                    for (int j : it->second) {
+                        if (norm2(p - pts[j]) <= h * h) {
+                            uf.unite(i, j);
+                        }
+                    }
+                }
+            }
+        }
+        grid[c].push_back(i);
+    }
+
+    std::unordered_map<int, int> root_to_vid;
+    std::unordered_map<int, Vec3> sums;
+    std::unordered_map<int, int> counts;
+    out_vertices.clear();
+    for (int i = 0; i < 2 * nseg; ++i) {
+        int r = uf.find(i);
+        if (root_to_vid.find(r) == root_to_vid.end()) {
+            int vid = static_cast<int>(root_to_vid.size());
+            root_to_vid[r] = vid;
+            sums[r] = pts[i];
+            counts[r] = 1;
+        } else {
+            sums[r] += pts[i];
+            counts[r] += 1;
+        }
+    }
+    out_vertices.resize(root_to_vid.size());
+    for (const auto& kv : root_to_vid) {
+        int r = kv.first;
+        int vid = kv.second;
+        out_vertices[vid] = sums[r] / static_cast<double>(counts[r]);
+    }
+
+    out_edges.clear();
+    for (int s = 0; s < nseg; ++s) {
+        int a = root_to_vid[uf.find(2 * s)];
+        int b = root_to_vid[uf.find(2 * s + 1)];
+        if (a != b) {
+            out_edges.emplace_back(a, b);
+        }
+    }
+}
+
+static std::pair<double, double> point_segment_dist2_and_t(const Vec3& p, const Vec3& a, const Vec3& b) {
+    Vec3 ab = b - a;
+    double denom = dot(ab, ab);
+    if (denom <= 1e-12) {
+        return {norm2(p - a), 0.0};
+    }
+    double t = dot(p - a, ab) / denom;
+    double t_clamped = std::min(1.0, std::max(0.0, t));
+    Vec3 proj = a + ab * t_clamped;
+    double d2 = norm2(p - proj);
+    return {d2, t_clamped};
+}
+
+static double seg_seg_dist2(const Vec3& p1, const Vec3& q1, const Vec3& p2, const Vec3& q2) {
+    Vec3 d1 = q1 - p1;
+    Vec3 d2 = q2 - p2;
+    Vec3 r = p1 - p2;
+    double a = dot(d1, d1);
+    double e = dot(d2, d2);
+    double f = dot(d2, r);
+
+    if (a <= 1e-12 && e <= 1e-12) {
+        return dot(p1 - p2, p1 - p2);
+    }
+    if (a <= 1e-12) {
+        double t = std::min(1.0, std::max(0.0, f / e));
+        Vec3 c = p2 + d2 * t;
+        return dot(p1 - c, p1 - c);
+    }
+    if (e <= 1e-12) {
+        double s = std::min(1.0, std::max(0.0, -dot(d1, r) / a));
+        Vec3 c = p1 + d1 * s;
+        return dot(c - p2, c - p2);
+    }
+
+    double b = dot(d1, d2);
+    double c = dot(d1, r);
+    double denom = a * e - b * b;
+    double s = 0.0;
+    if (std::abs(denom) > 0.0) {
+        s = std::min(1.0, std::max(0.0, (b * f - c * e) / denom));
+    }
+    double t = (b * s + f) / e;
+    if (t < 0.0) {
+        t = 0.0;
+        s = std::min(1.0, std::max(0.0, -c / a));
+    } else if (t > 1.0) {
+        t = 1.0;
+        s = std::min(1.0, std::max(0.0, (b - c) / a));
+    }
+    Vec3 cp1 = p1 + d1 * s;
+    Vec3 cp2 = p2 + d2 * t;
+    Vec3 diff = cp1 - cp2;
+    return dot(diff, diff);
+}
+
+static void label_segments_by_contact_greedy(const std::vector<std::pair<Vec3, Vec3>>& segments,
+                                             double tol,
+                                             std::vector<std::vector<int>>& comps) {
+    double h = tol;
+    int nseg = static_cast<int>(segments.size());
+    comps.clear();
+    if (nseg == 0) {
+        return;
+    }
+
+    std::unordered_map<Int3, std::vector<int>, Int3Hash> grid;
+    std::vector<std::pair<Vec3, Vec3>> seg_aabb;
+    std::vector<std::array<Vec3, 3>> rep_points;
+    seg_aabb.reserve(nseg);
+    rep_points.reserve(nseg);
+
+    for (int i = 0; i < nseg; ++i) {
+        Vec3 p0 = segments[i].first;
+        Vec3 p1 = segments[i].second;
+        Vec3 mid = (p0 + p1) * 0.5;
+        rep_points.push_back({p0, p1, mid});
+        Vec3 mn{std::min(p0.x, p1.x) - h, std::min(p0.y, p1.y) - h, std::min(p0.z, p1.z) - h};
+        Vec3 mx{std::max(p0.x, p1.x) + h, std::max(p0.y, p1.y) + h, std::max(p0.z, p1.z) + h};
+        seg_aabb.push_back({mn, mx});
+        for (const auto& rp : rep_points.back()) {
+            Int3 c = cell_index(rp, h);
+            grid[c].push_back(i);
+        }
+    }
+
+    auto nearby_candidates = [&](int i) {
+        std::vector<int> cand;
+        std::unordered_map<int, bool> mark;
+        for (const auto& rp : rep_points[i]) {
+            Int3 c = cell_index(rp, h);
+            for (int dx = -1; dx <= 1; ++dx) {
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dz = -1; dz <= 1; ++dz) {
+                        Int3 cc{c.x + dx, c.y + dy, c.z + dz};
+                        auto it = grid.find(cc);
+                        if (it == grid.end()) continue;
+                        for (int j : it->second) {
+                            if (j == i) continue;
+                            if (!mark[j]) {
+                                mark[j] = true;
+                                cand.push_back(j);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return cand;
+    };
+
+    auto aabb_overlap = [&](int i, int j) {
+        const Vec3& mn1 = seg_aabb[i].first;
+        const Vec3& mx1 = seg_aabb[i].second;
+        const Vec3& mn2 = seg_aabb[j].first;
+        const Vec3& mx2 = seg_aabb[j].second;
+        return !(mx1.x < mn2.x || mn1.x > mx2.x ||
+                 mx1.y < mn2.y || mn1.y > mx2.y ||
+                 mx1.z < mn2.z || mn1.z > mx2.z);
+    };
+
+    double tol2 = h * h;
+    std::vector<bool> visited(nseg, false);
+    for (int seed = 0; seed < nseg; ++seed) {
+        if (visited[seed]) continue;
+        std::vector<int> queue;
+        queue.push_back(seed);
+        visited[seed] = true;
+        std::vector<int> comp;
+        comp.push_back(seed);
+        while (!queue.empty()) {
+            int i = queue.back();
+            queue.pop_back();
+            Vec3 p1 = segments[i].first;
+            Vec3 q1 = segments[i].second;
+            for (int j : nearby_candidates(i)) {
+                if (visited[j]) continue;
+                if (!aabb_overlap(i, j)) continue;
+                Vec3 p2 = segments[j].first;
+                Vec3 q2 = segments[j].second;
+                if (seg_seg_dist2(p1, q1, p2, q2) <= tol2) {
+                    visited[j] = true;
+                    queue.push_back(j);
+                    comp.push_back(j);
+                }
+            }
+        }
+        comps.push_back(comp);
+    }
+    std::sort(comps.begin(), comps.end(), [](const auto& a, const auto& b) { return a.size() > b.size(); });
+}
+
+static void split_t_junctions(const std::vector<Vec3>& vertices,
+                              const std::vector<std::pair<int, int>>& edges,
+                              double tol,
+                              std::vector<Vec3>& out_vertices,
+                              std::vector<std::pair<int, int>>& out_edges) {
+    double h = tol;
+    double tol2 = h * h;
+    std::unordered_map<Int3, std::vector<int>, Int3Hash> vgrid;
+    for (int vid = 0; vid < static_cast<int>(vertices.size()); ++vid) {
+        Int3 c = cell_index(vertices[vid], h);
+        vgrid[c].push_back(vid);
+    }
+
+    out_vertices = vertices;
+    out_edges.clear();
+    for (const auto& e : edges) {
+        int a = e.first;
+        int b = e.second;
+        Vec3 pa = vertices[a];
+        Vec3 pb = vertices[b];
+        Vec3 mn{std::min(pa.x, pb.x) - h, std::min(pa.y, pb.y) - h, std::min(pa.z, pb.z) - h};
+        Vec3 mx{std::max(pa.x, pb.x) + h, std::max(pa.y, pb.y) + h, std::max(pa.z, pb.z) + h};
+        Int3 cmin = cell_index(mn, h);
+        Int3 cmax = cell_index(mx, h);
+
+        std::vector<std::pair<double, int>> splits;
+        for (int ix = cmin.x; ix <= cmax.x; ++ix) {
+            for (int iy = cmin.y; iy <= cmax.y; ++iy) {
+                for (int iz = cmin.z; iz <= cmax.z; ++iz) {
+                    auto it = vgrid.find(Int3{ix, iy, iz});
+                    if (it == vgrid.end()) continue;
+                    for (int vid : it->second) {
+                        if (vid == a || vid == b) continue;
+                        auto dt = point_segment_dist2_and_t(vertices[vid], pa, pb);
+                        if (dt.first <= tol2 && dt.second > 1e-6 && dt.second < 1.0 - 1e-6) {
+                            splits.emplace_back(dt.second, vid);
+                        }
+                    }
+                }
+            }
+        }
+        if (splits.empty()) {
+            out_edges.push_back(e);
+            continue;
+        }
+        std::sort(splits.begin(), splits.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        std::vector<int> chain;
+        chain.push_back(a);
+        int last = -1;
+        for (const auto& s : splits) {
+            if (s.second == last) continue;
+            chain.push_back(s.second);
+            last = s.second;
+        }
+        chain.push_back(b);
+        for (int i = 0; i + 1 < static_cast<int>(chain.size()); ++i) {
+            if (chain[i] != chain[i + 1]) {
+                out_edges.emplace_back(chain[i], chain[i + 1]);
+            }
+        }
+    }
+}
+
+static std::vector<std::vector<int>> extract_loops(const std::vector<Vec3>& vertices,
+                                                   const std::vector<std::pair<int, int>>& edges) {
+    int nv = static_cast<int>(vertices.size());
+    std::vector<std::vector<std::pair<int, int>>> adj(nv);
+    for (int ei = 0; ei < static_cast<int>(edges.size()); ++ei) {
+        int a = edges[ei].first;
+        int b = edges[ei].second;
+        adj[a].push_back({b, ei});
+        adj[b].push_back({a, ei});
+    }
+
+    std::vector<bool> used(edges.size(), false);
+    std::vector<int> start_vertices(nv);
+    for (int i = 0; i < nv; ++i) start_vertices[i] = i;
+    std::sort(start_vertices.begin(), start_vertices.end(), [&](int i, int j) {
+        int di = static_cast<int>(adj[i].size());
+        int dj = static_cast<int>(adj[j].size());
+        if ((di == 2) != (dj == 2)) return di == 2;
+        return di > dj;
+    });
+
+    std::vector<std::vector<int>> loops;
+    for (int sv : start_vertices) {
+        for (const auto& nb : adj[sv]) {
+            int ei = nb.second;
+            if (used[ei]) continue;
+            std::vector<int> path;
+            path.push_back(sv);
+            int prev = sv;
+            int cur = nb.first;
+            used[ei] = true;
+            path.push_back(cur);
+
+            int steps = 0;
+            while (steps < 100000) {
+                steps += 1;
+                if (cur == sv) {
+                    if (path.size() > 1) {
+                        path.pop_back();
+                        loops.push_back(path);
+                    }
+                    break;
+                }
+                std::vector<std::pair<int, int>> cand;
+                for (const auto& e : adj[cur]) {
+                    if (!used[e.second]) cand.push_back(e);
+                }
+                if (cand.empty()) {
+                    break;
+                }
+                std::pair<int, int> pick = cand[0];
+                for (const auto& c : cand) {
+                    if (c.first != prev) { pick = c; break; }
+                }
+                used[pick.second] = true;
+                prev = cur;
+                cur = pick.first;
+                path.push_back(cur);
+            }
+        }
+    }
+    return loops;
+}
+
+static std::pair<Vec3, Vec3> accumulate_Sn_Gn_from_polyline(const std::vector<Vec3>& loop_pts) {
+    Vec3 Sn{0.0, 0.0, 0.0};
+    Vec3 Gn{0.0, 0.0, 0.0};
+    int m = static_cast<int>(loop_pts.size());
+    for (int i = 0; i < m; ++i) {
+        const Vec3& p0 = loop_pts[i];
+        const Vec3& p1 = loop_pts[(i + 1) % m];
+        Sn += cross(p0, p1) * 0.5;
+        Vec3 dx = p1 - p0;
+        double s = dot(p0, p1) + (1.0 / 3.0) * dot(dx, dx);
+        Gn += dx * (-(1.0 / 3.0) * s);
+    }
+    return {Sn, Gn};
+}
+
+static bool contact_point_xc0(const Vec3& Sn, const Vec3& Gn, Vec3& xc0, Vec3& nA, double& area) {
+    area = norm(Sn);
+    if (area < 1e-14) {
+        xc0 = Vec3{0.0, 0.0, 0.0};
+        nA = Vec3{0.0, 0.0, 0.0};
+        return false;
+    }
+    nA = Sn * (-1.0 / area);
+    xc0 = cross(nA, Gn) / area;
+    return true;
 }
 
 static Vec3 support_point(const Mesh& mesh, const Transform& tf, const Vec3& dir) {
@@ -541,10 +1133,13 @@ struct SimConfig {
     double cn = 0.0;
     double mass = 1.0;
     Vec3 gravity{0.0, -9.81, 0.0};
+    double mesh_scale = 0.001;
+    bool split_contacts = true;
     bool center_mesh = true;
     std::string stl_path;
     std::string vtk_prefix = "particles";
     int output_interval = 1;
+    std::string output_dir = "output";
     Vec3 v0{0.0, 0.0, 0.0};
     Vec3 v1{0.0, 0.0, 0.0};
 };
@@ -593,6 +1188,12 @@ static bool parse_config_file(const std::string& path, SimConfig& cfg) {
             iss >> cfg.cn;
         } else if (key == "mass") {
             iss >> cfg.mass;
+        } else if (key == "mesh_scale") {
+            iss >> cfg.mesh_scale;
+        } else if (key == "split_contacts") {
+            int v = 1;
+            iss >> v;
+            cfg.split_contacts = (v != 0);
         } else if (key == "gravity") {
             iss >> cfg.gravity.x >> cfg.gravity.y >> cfg.gravity.z;
         } else if (key == "center_mesh") {
@@ -603,6 +1204,8 @@ static bool parse_config_file(const std::string& path, SimConfig& cfg) {
             iss >> cfg.vtk_prefix;
         } else if (key == "output_interval") {
             iss >> cfg.output_interval;
+        } else if (key == "output_dir") {
+            iss >> cfg.output_dir;
         } else if (key == "v0") {
             iss >> cfg.v0.x >> cfg.v0.y >> cfg.v0.z;
         } else if (key == "v1") {
@@ -635,6 +1238,7 @@ static void usage() {
 }
 
 static void write_vtk_particles(const std::string& path,
+                                const Mesh& mesh,
                                 const std::vector<Particle>& particles,
                                 const std::vector<Vec3>& forces,
                                 const std::vector<Vec3>& torques,
@@ -648,74 +1252,108 @@ static void write_vtk_particles(const std::string& path,
     out << "zdem particles\n";
     out << "ASCII\n";
     out << "DATASET POLYDATA\n";
-    out << "POINTS " << particles.size() << " float\n";
+    const std::size_t tris_per_particle = mesh.tris.size();
+    const std::size_t total_tris = tris_per_particle * particles.size();
+    const std::size_t total_points = total_tris * 3;
+    out << "POINTS " << total_points << " float\n";
     for (const auto& p : particles) {
-        out << static_cast<float>(p.tf.pos.x) << " "
-            << static_cast<float>(p.tf.pos.y) << " "
-            << static_cast<float>(p.tf.pos.z) << "\n";
+        for (const auto& tri : mesh.tris) {
+            Vec3 v0 = quat_rotate(p.tf.rot, tri[0]) + p.tf.pos;
+            Vec3 v1 = quat_rotate(p.tf.rot, tri[1]) + p.tf.pos;
+            Vec3 v2 = quat_rotate(p.tf.rot, tri[2]) + p.tf.pos;
+            out << static_cast<float>(v0.x) << " " << static_cast<float>(v0.y) << " " << static_cast<float>(v0.z) << "\n";
+            out << static_cast<float>(v1.x) << " " << static_cast<float>(v1.y) << " " << static_cast<float>(v1.z) << "\n";
+            out << static_cast<float>(v2.x) << " " << static_cast<float>(v2.y) << " " << static_cast<float>(v2.z) << "\n";
+        }
     }
 
-    out << "POINT_DATA " << particles.size() << "\n";
+    out << "POLYGONS " << total_tris << " " << total_tris * 4 << "\n";
+    for (std::size_t i = 0; i < total_tris; ++i) {
+        std::size_t base = i * 3;
+        out << "3 " << base << " " << base + 1 << " " << base + 2 << "\n";
+    }
+
+    out << "CELL_DATA " << total_tris << "\n";
 
     out << "SCALARS id int 1\n";
     out << "LOOKUP_TABLE default\n";
     for (int i = 0; i < static_cast<int>(particles.size()); ++i) {
-        out << i << "\n";
+        for (std::size_t t = 0; t < tris_per_particle; ++t) {
+            out << i << "\n";
+        }
     }
 
     out << "SCALARS mass float 1\n";
     out << "LOOKUP_TABLE default\n";
     for (const auto& p : particles) {
-        out << static_cast<float>(p.mass) << "\n";
+        for (std::size_t t = 0; t < tris_per_particle; ++t) {
+            out << static_cast<float>(p.mass) << "\n";
+        }
     }
 
     out << "SCALARS radius float 1\n";
     out << "LOOKUP_TABLE default\n";
     for (const auto& p : particles) {
-        out << static_cast<float>(p.radius) << "\n";
+        for (std::size_t t = 0; t < tris_per_particle; ++t) {
+            out << static_cast<float>(p.radius) << "\n";
+        }
     }
 
     out << "SCALARS contact_count int 1\n";
     out << "LOOKUP_TABLE default\n";
     for (int c : contact_counts) {
-        out << c << "\n";
+        for (std::size_t t = 0; t < tris_per_particle; ++t) {
+            out << c << "\n";
+        }
     }
 
     out << "VECTORS velocity float\n";
     for (const auto& p : particles) {
-        out << static_cast<float>(p.vel.x) << " "
-            << static_cast<float>(p.vel.y) << " "
-            << static_cast<float>(p.vel.z) << "\n";
+        for (std::size_t t = 0; t < tris_per_particle; ++t) {
+            out << static_cast<float>(p.vel.x) << " "
+                << static_cast<float>(p.vel.y) << " "
+                << static_cast<float>(p.vel.z) << "\n";
+        }
     }
 
     out << "VECTORS omega float\n";
     for (const auto& p : particles) {
-        out << static_cast<float>(p.omega.x) << " "
-            << static_cast<float>(p.omega.y) << " "
-            << static_cast<float>(p.omega.z) << "\n";
+        for (std::size_t t = 0; t < tris_per_particle; ++t) {
+            out << static_cast<float>(p.omega.x) << " "
+                << static_cast<float>(p.omega.y) << " "
+                << static_cast<float>(p.omega.z) << "\n";
+        }
     }
 
     out << "VECTORS force float\n";
-    for (const auto& f : forces) {
-        out << static_cast<float>(f.x) << " "
-            << static_cast<float>(f.y) << " "
-            << static_cast<float>(f.z) << "\n";
+    for (std::size_t i = 0; i < particles.size(); ++i) {
+        for (std::size_t t = 0; t < tris_per_particle; ++t) {
+            const Vec3& f = forces[i];
+            out << static_cast<float>(f.x) << " "
+                << static_cast<float>(f.y) << " "
+                << static_cast<float>(f.z) << "\n";
+        }
     }
 
     out << "VECTORS torque float\n";
-    for (const auto& t : torques) {
-        out << static_cast<float>(t.x) << " "
-            << static_cast<float>(t.y) << " "
-            << static_cast<float>(t.z) << "\n";
+    for (std::size_t i = 0; i < particles.size(); ++i) {
+        for (std::size_t t = 0; t < tris_per_particle; ++t) {
+            const Vec3& tt = torques[i];
+            out << static_cast<float>(tt.x) << " "
+                << static_cast<float>(tt.y) << " "
+                << static_cast<float>(tt.z) << "\n";
+        }
     }
 
     out << "FIELD FieldData 1\n";
-    out << "orientation 4 " << particles.size() << " float\n";
+    out << "orientation 4 " << total_tris << " float\n";
     for (const auto& p : particles) {
-        out << static_cast<float>(p.tf.rot.w) << " "
-            << static_cast<float>(p.tf.rot.x) << " "
-            << static_cast<float>(p.tf.rot.y) << " "
-            << static_cast<float>(p.tf.rot.z) << "\n";
+        for (std::size_t t = 0; t < tris_per_particle; ++t) {
+            out << static_cast<float>(p.tf.rot.w) << " "
+                << static_cast<float>(p.tf.rot.x) << " "
+                << static_cast<float>(p.tf.rot.y) << " "
+                << static_cast<float>(p.tf.rot.z) << "\n";
+        }
     }
 }
 
@@ -734,6 +1372,12 @@ int main(int argc, char** argv) {
     if (!load_stl(cfg.stl_path, tris)) {
         std::cerr << "Failed to load STL: " << cfg.stl_path << "\n";
         return 1;
+    }
+
+    for (auto& tri : tris) {
+        tri[0] *= cfg.mesh_scale;
+        tri[1] *= cfg.mesh_scale;
+        tri[2] *= cfg.mesh_scale;
     }
 
     Mesh mesh = build_mesh(tris, cfg.center_mesh);
@@ -769,12 +1413,22 @@ int main(int argc, char** argv) {
     std::vector<Vec3> torques(cfg.n);
     std::vector<int> contact_counts(cfg.n);
 
+    std::filesystem::create_directories(cfg.output_dir);
+
     for (int step = 0; step < cfg.steps; ++step) {
+        auto step_t0 = std::chrono::steady_clock::now();
         std::fill(forces.begin(), forces.end(), Vec3{});
         std::fill(torques.begin(), torques.end(), Vec3{});
         std::fill(contact_counts.begin(), contact_counts.end(), 0);
 
         int contacts = 0;
+        std::size_t total_segments = 0;
+        std::size_t total_loops = 0;
+        std::size_t total_comps = 0;
+        std::size_t tri_checks = 0;
+        auto t_tri = std::chrono::steady_clock::duration::zero();
+        auto t_rebuild = std::chrono::steady_clock::duration::zero();
+        auto t_output = std::chrono::steady_clock::duration::zero();
         for (int i = 0; i < cfg.n; ++i) {
             for (int j = i + 1; j < cfg.n; ++j) {
                 Particle& pa = particles[i];
@@ -785,33 +1439,168 @@ int main(int argc, char** argv) {
                 if (dist2 > rsum * rsum) {
                     continue;
                 }
-                Simplex simplex;
-                if (!gjk_intersect(mesh, pa.tf, mesh, pb.tf, simplex)) {
-                    continue;
-                }
 
-                Vec3 normal{0.0, 1.0, 0.0};
-                double depth = 0.0;
-                if (!epa_penetration(mesh, pa.tf, mesh, pb.tf, simplex, normal, depth)) {
-                    Vec3 fallback = normalize(dpos);
-                    if (norm(fallback) > 0.0) {
-                        normal = fallback;
-                        depth = rsum - std::sqrt(dist2);
+                auto t0 = std::chrono::steady_clock::now();
+                std::vector<std::array<Vec3, 3>> trisA = transform_tris(mesh, pa.tf);
+                std::vector<std::array<Vec3, 3>> trisB = transform_tris(mesh, pb.tf);
+
+                std::vector<Vec3> nA_all(trisA.size());
+                std::vector<Vec3> nB_all(trisB.size());
+                std::vector<std::pair<Vec3, double>> planesA(trisA.size());
+                std::vector<std::pair<Vec3, double>> planesB(trisB.size());
+
+                for (std::size_t ta = 0; ta < trisA.size(); ++ta) {
+                    Vec3 n; double d;
+                    if (!plane_from_tri(trisA[ta], n, d)) {
+                        nA_all[ta] = Vec3{0.0, 0.0, 0.0};
+                        planesA[ta] = {Vec3{0.0, 0.0, 0.0}, 0.0};
+                    } else {
+                        nA_all[ta] = n;
+                        planesA[ta] = {n, d};
+                    }
+                }
+                for (std::size_t tb = 0; tb < trisB.size(); ++tb) {
+                    Vec3 n; double d;
+                    if (!plane_from_tri(trisB[tb], n, d)) {
+                        nB_all[tb] = Vec3{0.0, 0.0, 0.0};
+                        planesB[tb] = {Vec3{0.0, 0.0, 0.0}, 0.0};
+                    } else {
+                        nB_all[tb] = n;
+                        planesB[tb] = {n, d};
                     }
                 }
 
-                Vec3 rel_vel = pb.vel - pa.vel;
-                double vn = dot(rel_vel, normal);
-                double fn = cfg.kn * depth - cfg.cn * vn;
-                if (fn < 0.0) {
-                    fn = 0.0;
+                std::vector<Vec3> aabbA_min(trisA.size());
+                std::vector<Vec3> aabbA_max(trisA.size());
+                std::vector<Vec3> aabbB_min(trisB.size());
+                std::vector<Vec3> aabbB_max(trisB.size());
+                for (std::size_t ta = 0; ta < trisA.size(); ++ta) {
+                    Vec3 mn{std::min({trisA[ta][0].x, trisA[ta][1].x, trisA[ta][2].x}),
+                            std::min({trisA[ta][0].y, trisA[ta][1].y, trisA[ta][2].y}),
+                            std::min({trisA[ta][0].z, trisA[ta][1].z, trisA[ta][2].z})};
+                    Vec3 mx{std::max({trisA[ta][0].x, trisA[ta][1].x, trisA[ta][2].x}),
+                            std::max({trisA[ta][0].y, trisA[ta][1].y, trisA[ta][2].y}),
+                            std::max({trisA[ta][0].z, trisA[ta][1].z, trisA[ta][2].z})};
+                    aabbA_min[ta] = mn;
+                    aabbA_max[ta] = mx;
                 }
-                Vec3 f = normal * fn;
-                forces[i] -= f;
-                forces[j] += f;
-                contact_counts[i] += 1;
-                contact_counts[j] += 1;
-                contacts++;
+                for (std::size_t tb = 0; tb < trisB.size(); ++tb) {
+                    Vec3 mn{std::min({trisB[tb][0].x, trisB[tb][1].x, trisB[tb][2].x}),
+                            std::min({trisB[tb][0].y, trisB[tb][1].y, trisB[tb][2].y}),
+                            std::min({trisB[tb][0].z, trisB[tb][1].z, trisB[tb][2].z})};
+                    Vec3 mx{std::max({trisB[tb][0].x, trisB[tb][1].x, trisB[tb][2].x}),
+                            std::max({trisB[tb][0].y, trisB[tb][1].y, trisB[tb][2].y}),
+                            std::max({trisB[tb][0].z, trisB[tb][1].z, trisB[tb][2].z})};
+                    aabbB_min[tb] = mn;
+                    aabbB_max[tb] = mx;
+                }
+
+                double tol = mesh.mean_edge > 0.0 ? (mesh.mean_edge * 0.1) : (mesh.bbox_diag * 1e-2);
+                if (tol <= 0.0) {
+                    tol = 1e-6;
+                }
+
+                std::vector<std::pair<Vec3, Vec3>> segments;
+                for (std::size_t ta = 0; ta < trisA.size(); ++ta) {
+                    if (norm2(nA_all[ta]) < 1e-30) {
+                        continue;
+                    }
+                    for (std::size_t tb = 0; tb < trisB.size(); ++tb) {
+                        tri_checks++;
+                        if (aabbA_max[ta].x < aabbB_min[tb].x || aabbA_min[ta].x > aabbB_max[tb].x ||
+                            aabbA_max[ta].y < aabbB_min[tb].y || aabbA_min[ta].y > aabbB_max[tb].y ||
+                            aabbA_max[ta].z < aabbB_min[tb].z || aabbA_min[ta].z > aabbB_max[tb].z) {
+                            continue;
+                        }
+                        if (norm2(nB_all[tb]) < 1e-30) {
+                            continue;
+                        }
+                        Vec3 p0, p1;
+                        if (tri_tri_intersection_segment(trisA[ta], planesA[ta].first, planesA[ta].second,
+                                                         trisB[tb], planesB[tb].first, planesB[tb].second,
+                                                         p0, p1)) {
+                            segments.emplace_back(p0, p1);
+                        }
+                    }
+                }
+                t_tri += std::chrono::steady_clock::now() - t0;
+
+                if (segments.empty()) {
+                    continue;
+                }
+
+                t0 = std::chrono::steady_clock::now();
+                std::vector<std::vector<int>> comps;
+                if (cfg.split_contacts) {
+                    label_segments_by_contact_greedy(segments, tol, comps);
+                } else {
+                    comps.resize(1);
+                    comps[0].reserve(segments.size());
+                    for (int s = 0; s < static_cast<int>(segments.size()); ++s) {
+                        comps[0].push_back(s);
+                    }
+                }
+                total_segments += segments.size();
+                total_comps += comps.size();
+
+                for (const auto& comp : comps) {
+                    std::vector<std::pair<Vec3, Vec3>> segs;
+                    segs.reserve(comp.size());
+                    for (int idx : comp) {
+                        segs.push_back(segments[idx]);
+                    }
+
+                    std::vector<Vec3> V;
+                    std::vector<std::pair<int, int>> edges;
+                    snap_endpoints(segs, tol, V, edges);
+
+                    std::vector<Vec3> V2;
+                    std::vector<std::pair<int, int>> edges2;
+                    split_t_junctions(V, edges, tol, V2, edges2);
+
+                    std::vector<std::vector<int>> loops_vids = extract_loops(V2, edges2);
+                    if (loops_vids.empty()) {
+                        continue;
+                    }
+                    total_loops += loops_vids.size();
+
+                    for (const auto& lv : loops_vids) {
+                        if (lv.size() < 3) {
+                            continue;
+                        }
+                        std::vector<Vec3> loop_pts;
+                        loop_pts.reserve(lv.size());
+                        for (int vid : lv) {
+                            loop_pts.push_back(V2[vid]);
+                        }
+                        Vec3 Sn, Gn;
+                        auto acc = accumulate_Sn_Gn_from_polyline(loop_pts);
+                        Sn = acc.first;
+                        Gn = acc.second;
+                        Vec3 xc0, nA;
+                        double area = 0.0;
+                        if (!contact_point_xc0(Sn, Gn, xc0, nA, area)) {
+                            continue;
+                        }
+                        Vec3 rA = xc0 - pa.tf.pos;
+                        Vec3 rB = xc0 - pb.tf.pos;
+                        Vec3 vA = pa.vel + cross(pa.omega, rA);
+                        Vec3 vB = pb.vel + cross(pb.omega, rB);
+                        Vec3 vrel = vB - vA;
+                        double vn = dot(vrel, nA);
+                        double fn = 0.5 * cfg.kn * area - cfg.cn * vn;
+                        if (fn < 0.0) fn = 0.0;
+                        Vec3 f = nA * fn;
+                        forces[i] -= f;
+                        forces[j] += f;
+                        torques[i] += cross(rA, f * -1.0);
+                        torques[j] += cross(rB, f);
+                        contact_counts[i] += 1;
+                        contact_counts[j] += 1;
+                        contacts++;
+                    }
+                }
+                t_rebuild += std::chrono::steady_clock::now() - t0;
             }
         }
 
@@ -822,10 +1611,27 @@ int main(int argc, char** argv) {
         if (step % cfg.output_interval == 0) {
             std::ostringstream oss;
             oss << cfg.vtk_prefix << "_" << std::setw(6) << std::setfill('0') << step << ".vtk";
-            write_vtk_particles(oss.str(), particles, forces, torques, contact_counts);
+            std::filesystem::path out_path = std::filesystem::path(cfg.output_dir) / oss.str();
+            auto t_out0 = std::chrono::steady_clock::now();
+            write_vtk_particles(out_path.string(), mesh, particles, forces, torques, contact_counts);
+            t_output += std::chrono::steady_clock::now() - t_out0;
         }
-
+        auto step_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - step_t0).count();
         std::cout << "step=" << step << " contacts=" << contacts << "\n";
+        if (step % 50 == 0 || step_ms >= 2000) {
+            auto tri_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_tri).count();
+            auto rebuild_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_rebuild).count();
+            auto out_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_output).count();
+            std::cout << "  profile: step_ms=" << step_ms
+                      << " tri_ms=" << tri_ms
+                      << " rebuild_ms=" << rebuild_ms
+                      << " output_ms=" << out_ms
+                      << " tri_checks=" << tri_checks
+                      << " segments=" << total_segments
+                      << " comps=" << total_comps
+                      << " loops=" << total_loops
+                      << "\n";
+        }
     }
 
     std::cout << "done\n";

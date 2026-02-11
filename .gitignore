@@ -42,6 +42,7 @@ env/
 *.pvd
 *_transformed.vtk
 routeB_intersection.vtk
+output/
 
 # Temporary files
 *.tmp

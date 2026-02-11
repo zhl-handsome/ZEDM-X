@@ -1,0 +1,18 @@
+# Minimal single-thread CPU run configuration
+stl = geometry/low-poly-banbana.stl
+n = 2
+steps = 1000
+dt = 0.001
+spacing = 1.5
+kn = 100000
+cn = 50
+mass = 1.0
+mesh_scale = 0.001
+split_contacts = 1
+gravity = 0 0 0
+center_mesh = 1
+vtk_prefix = particles
+output_dir = output
+output_interval = 10
+v0 = 1 0 0
+v1 = -1 0 0
