@@ -1193,8 +1193,9 @@ static std::vector<Vec3> get_particle_plane_section(const Mesh& mesh, const Tran
             if (d0 < min_dist) min_dist = d0;
             if (d1 < min_dist) min_dist = d1;
 
-            // Check if edge actually crosses the plane (strict condition)
-            if (d0 * d1 < -tol * tol) {
+            // Check if edge crosses the plane or touches it
+            // Condition: d0 and d1 have opposite signs (crossing) or one is near zero (touching)
+            if (d0 * d1 < 0.0) {
                 // Edge crosses the plane - compute intersection point
                 double t = d0 / (d0 - d1);
                 t = std::min(1.0, std::max(0.0, t));
@@ -1227,8 +1228,8 @@ static bool compute_wall_contact(const Mesh& particle_mesh, const Transform& par
     std::vector<Vec3> section_3d = get_particle_plane_section(particle_mesh, particle_tf,
                                                                plane_n, plane_d, tol, penetration);
 
-    // Only consider contact if there is actual penetration
-    if (penetration <= tol) {
+    // Only consider contact if there is actual penetration (particle vertices behind wall plane)
+    if (penetration <= 0.0) {
         return false;
     }
 
@@ -2413,13 +2414,14 @@ int main(int argc, char** argv) {
                     cn = std::abs(cn);
                     ct = std::abs(ct);
 
-                    // Normal force using actual penetration depth
-                    // fn = kn * penetration (Hookean spring model)
-                    double fn = kn * penetration;
-                    // Add damping force when approaching
-                    if (vn < 0.0) {
-                        fn += -cn * vn;
-                    }
+                    // Normal force using overlap area (Feng 2021 energy-conserving model)
+                    // Elastic: F_n^e = k_n * deltaV^(1/3) * n
+                    // Damping: F_n^d = -c_n * (v_r · n) * n
+                    // Total: F_n = F_n^e + F_n^d
+                    double deltaV = std::pow(A_n, 1.5);
+                    double fn_elastic = kn * std::cbrt(deltaV);
+                    double fn_damping = -cn * vn;
+                    double fn = fn_elastic + fn_damping;
                     if (fn < 0.0) fn = 0.0;
                     Vec3 fn_vec = contact_normal * fn;
 
