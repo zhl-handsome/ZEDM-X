@@ -1169,15 +1169,11 @@ static Vec3 unproject_to_3d(const Vec2& p2d, const Vec3& origin, const Vec3& u, 
 
 // Get particle cross-section polygon at a plane (defined by wall triangle)
 // Returns vertices of the polygon formed by intersecting particle mesh with the plane
-// Also returns the maximum penetration depth (negative distance behind plane)
 static std::vector<Vec3> get_particle_plane_section(const Mesh& mesh, const Transform& tf,
                                                      const Vec3& plane_n, double plane_d,
-                                                     double tol, double& out_penetration) {
+                                                     double tol) {
     std::vector<Vec3> section_pts;
     std::vector<std::array<Vec3, 3>> tris = transform_tris(mesh, tf);
-
-    out_penetration = 0.0;
-    double min_dist = std::numeric_limits<double>::infinity();
 
     for (const auto& tri : tris) {
         // Check each edge for intersection with plane
@@ -1189,12 +1185,7 @@ static std::vector<Vec3> get_particle_plane_section(const Mesh& mesh, const Tran
             double d0 = dot(plane_n, p0) + plane_d;
             double d1 = dot(plane_n, p1) + plane_d;
 
-            // Track minimum distance (penetration if negative)
-            if (d0 < min_dist) min_dist = d0;
-            if (d1 < min_dist) min_dist = d1;
-
-            // Check if edge crosses the plane or touches it
-            // Condition: d0 and d1 have opposite signs (crossing) or one is near zero (touching)
+            // Check if edge crosses the plane
             if (d0 * d1 < 0.0) {
                 // Edge crosses the plane - compute intersection point
                 double t = d0 / (d0 - d1);
@@ -1205,33 +1196,23 @@ static std::vector<Vec3> get_particle_plane_section(const Mesh& mesh, const Tran
         }
     }
 
-    // Penetration depth is negative of minimum distance
-    out_penetration = -min_dist;
-
     // Remove duplicate points
     return unique_points(section_pts, tol);
 }
 
 // Compute wall-particle contact using Sutherland-Hodgman clipping
-// Returns: overlap area, contact point (in 3D), contact normal (wall normal), penetration depth
+// Returns: overlap area, contact point (in 3D), contact normal (wall normal)
 static bool compute_wall_contact(const Mesh& particle_mesh, const Transform& particle_tf,
                                   const std::array<Vec3, 3>& wall_tri, const Vec3& wall_normal,
                                   double particle_radius, double tol,
-                                  double& out_area, Vec3& out_contact_point, Vec3& out_normal,
-                                  double& out_penetration) {
+                                  double& out_area, Vec3& out_contact_point, Vec3& out_normal) {
     // Compute wall plane
     Vec3 plane_n = wall_normal;
     double plane_d = -dot(plane_n, wall_tri[0]);
 
-    // Get particle cross-section at wall plane and penetration depth
-    double penetration;
+    // Get particle cross-section at wall plane
     std::vector<Vec3> section_3d = get_particle_plane_section(particle_mesh, particle_tf,
-                                                               plane_n, plane_d, tol, penetration);
-
-    // Only consider contact if there is actual penetration (particle vertices behind wall plane)
-    if (penetration <= 0.0) {
-        return false;
-    }
+                                                               plane_n, plane_d, tol);
 
     if (section_3d.size() < 3) {
         return false;
@@ -1273,7 +1254,6 @@ static bool compute_wall_contact(const Mesh& particle_mesh, const Transform& par
     out_area = area;
     out_contact_point = contact_point;
     out_normal = plane_n;
-    out_penetration = penetration;
     return true;
 }
 
@@ -2373,10 +2353,10 @@ int main(int argc, char** argv) {
                     }
 
                     // Compute wall contact using Sutherland-Hodgman clipping
-                    double area, penetration;
+                    double area;
                     Vec3 contact_point, contact_normal;
                     if (!compute_wall_contact(pmesh, p.tf, wtri, wn, p.radius, tol,
-                                              area, contact_point, contact_normal, penetration)) {
+                                              area, contact_point, contact_normal)) {
                         continue;
                     }
 
@@ -2457,7 +2437,6 @@ int main(int argc, char** argv) {
                         std::cout << "  wall_contact: particle=" << i << " wall=" << w
                                   << " tri=" << t
                                   << " area=" << area
-                                  << " penetration=" << penetration
                                   << " xc=" << contact_point.x << "," << contact_point.y << "," << contact_point.z
                                   << " n=" << contact_normal.x << "," << contact_normal.y << "," << contact_normal.z
                                   << " F=" << f.x << "," << f.y << "," << f.z
