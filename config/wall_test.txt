@@ -1,0 +1,51 @@
+# Wall contact test configuration
+# Tests particle-wall collision with a banana particle falling onto a plane wall
+
+steps = 2000
+dt = 0.001
+split_contacts = 0
+gravity = 0 0 -9.81 
+center_mesh = 1
+vtk_prefix = wall_test
+output_dir = output
+output_interval = 20
+
+# Wall: a thin box positioned below the particle
+wall
+stl = geometry/wall_plane.stl
+pos = 0 0 0
+quat = 1 0 0 0
+scale = 1.0
+mu = 0.5
+restitution = 0.7
+end_wall
+
+# Particle: banana falling from above
+particle
+stl = geometry/low-poly-banbana.stl
+pos = 0 -0.5 0.5
+vel = 0 0 0
+quat = 1 0 0 0
+omega = 0 0 0
+scale = 0.001
+density = 2500
+young = 1e7
+poisson = 0.25
+mu = 0.5
+restitution = 0.7
+end_particle
+
+
+particle
+stl = geometry/low-poly-banbana.stl
+pos = 0 0.5 0.5
+vel = 0 0 0
+quat = 1 0 0 0
+omega = 0 0 0
+scale = 0.001
+density = 2500
+young = 1e7
+poisson = 0.25
+mu = 0.5
+restitution = 0.7
+end_particle

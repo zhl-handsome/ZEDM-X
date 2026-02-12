@@ -267,6 +267,23 @@ struct Particle {
     int mesh_index = 0;
 };
 
+struct WallInit {
+    std::string stl_path;
+    Vec3 pos{0.0, 0.0, 0.0};
+    Quat rot{1.0, 0.0, 0.0, 0.0};
+    double scale = 1.0;
+    double mu = 0.5;
+    double restitution = 0.5;
+};
+
+struct Wall {
+    Mesh mesh;
+    Transform tf;
+    double mu = 0.5;
+    double restitution = 0.5;
+    std::vector<Vec3> tri_normals;
+};
+
 static std::vector<Vec3> unique_vertices(const std::vector<std::array<Vec3, 3>>& tris) {
     std::vector<Vec3> verts;
     const double tol = 1e-10;
@@ -1034,6 +1051,218 @@ static bool contact_point_xc0(const Vec3& Sn, const Vec3& Gn, Vec3& xc0, Vec3& n
     return true;
 }
 
+// ============== Sutherland-Hodgman Polygon Clipping for Wall Contact ==============
+
+// 2D point for clipping algorithm
+struct Vec2 {
+    double x = 0.0;
+    double y = 0.0;
+    Vec2() = default;
+    Vec2(double x_, double y_) : x(x_), y(y_) {}
+    Vec2 operator+(const Vec2& o) const { return Vec2{x + o.x, y + o.y}; }
+    Vec2 operator-(const Vec2& o) const { return Vec2{x - o.x, y - o.y}; }
+    Vec2 operator*(double s) const { return Vec2{x * s, y * s}; }
+};
+
+static inline double cross2d(const Vec2& a, const Vec2& b) {
+    return a.x * b.y - a.y * b.x;
+}
+
+// Check if point p is inside the clipping edge (on the left side of edge from cp1 to cp2)
+static inline bool is_inside_clip(const Vec2& p, const Vec2& cp1, const Vec2& cp2) {
+    return cross2d(cp2 - cp1, p - cp1) >= 0.0;
+}
+
+// Compute intersection of line segment (s, e) with clipping edge (cp1, cp2)
+static inline Vec2 compute_intersection_clip(const Vec2& s, const Vec2& e,
+                                              const Vec2& cp1, const Vec2& cp2) {
+    Vec2 dc = cp1 - cp2;
+    Vec2 dp = s - e;
+    double n1 = cross2d(cp1, cp2);
+    double n2 = cross2d(s, e);
+    double n3 = cross2d(dc, dp);
+    if (std::abs(n3) < 1e-30) {
+        return s;
+    }
+    double t = (n1 * dp.x - n2 * dc.x) / n3;
+    double u = (n1 * dp.y - n2 * dc.y) / n3;
+    return Vec2{t, u};
+}
+
+// Sutherland-Hodgman polygon clipping algorithm
+static std::vector<Vec2> sutherland_hodgman_clip(const std::vector<Vec2>& subject,
+                                                  const std::vector<Vec2>& clip) {
+    std::vector<Vec2> output = subject;
+    if (clip.size() < 3 || subject.size() < 3) {
+        return output;
+    }
+
+    Vec2 cp1 = clip.back();
+    for (const auto& cp2 : clip) {
+        if (output.empty()) break;
+
+        std::vector<Vec2> input = output;
+        output.clear();
+
+        Vec2 s = input.back();
+        for (const auto& e : input) {
+            if (is_inside_clip(e, cp1, cp2)) {
+                if (!is_inside_clip(s, cp1, cp2)) {
+                    output.push_back(compute_intersection_clip(s, e, cp1, cp2));
+                }
+                output.push_back(e);
+            } else if (is_inside_clip(s, cp1, cp2)) {
+                output.push_back(compute_intersection_clip(s, e, cp1, cp2));
+            }
+            s = e;
+        }
+        cp1 = cp2;
+    }
+    return output;
+}
+
+// Compute 2D polygon area using shoelace formula
+static double polygon_area_2d(const std::vector<Vec2>& poly) {
+    if (poly.size() < 3) return 0.0;
+    double area = 0.0;
+    int n = static_cast<int>(poly.size());
+    for (int i = 0; i < n; ++i) {
+        int j = (i + 1) % n;
+        area += cross2d(poly[i], poly[j]);
+    }
+    return std::abs(area) * 0.5;
+}
+
+// Compute 2D polygon centroid
+static Vec2 polygon_centroid_2d(const std::vector<Vec2>& poly) {
+    if (poly.empty()) return Vec2{0.0, 0.0};
+    Vec2 c{0.0, 0.0};
+    for (const auto& p : poly) {
+        c.x += p.x;
+        c.y += p.y;
+    }
+    double n = static_cast<double>(poly.size());
+    return Vec2{c.x / n, c.y / n};
+}
+
+// Build orthonormal basis from a normal vector
+static void build_basis(const Vec3& n, Vec3& u, Vec3& v) {
+    // Choose a vector not parallel to n
+    if (std::abs(n.x) < 0.9) {
+        u = normalize(cross(n, Vec3{1.0, 0.0, 0.0}));
+    } else {
+        u = normalize(cross(n, Vec3{0.0, 1.0, 0.0}));
+    }
+    v = cross(n, u);
+}
+
+// Project 3D point to 2D using basis vectors
+static Vec2 project_to_2d(const Vec3& p, const Vec3& origin, const Vec3& u, const Vec3& v) {
+    Vec3 d = p - origin;
+    return Vec2{dot(d, u), dot(d, v)};
+}
+
+// Unproject 2D point back to 3D
+static Vec3 unproject_to_3d(const Vec2& p2d, const Vec3& origin, const Vec3& u, const Vec3& v) {
+    return origin + u * p2d.x + v * p2d.y;
+}
+
+// Get particle cross-section polygon at a plane (defined by wall triangle)
+// Returns vertices of the polygon formed by intersecting particle mesh with the plane
+static std::vector<Vec3> get_particle_plane_section(const Mesh& mesh, const Transform& tf,
+                                                     const Vec3& plane_n, double plane_d,
+                                                     double tol) {
+    std::vector<Vec3> section_pts;
+    std::vector<std::array<Vec3, 3>> tris = transform_tris(mesh, tf);
+
+    for (const auto& tri : tris) {
+        // Check each edge for intersection with plane
+        for (int i = 0; i < 3; ++i) {
+            int j = (i + 1) % 3;
+            Vec3 p0 = tri[i];
+            Vec3 p1 = tri[j];
+
+            double d0 = dot(plane_n, p0) + plane_d;
+            double d1 = dot(plane_n, p1) + plane_d;
+
+            // Check if edge crosses the plane
+            if ((d0 >= -tol && d1 <= tol) || (d0 <= tol && d1 >= -tol)) {
+                // Edge intersects or touches plane
+                if (std::abs(d0 - d1) < 1e-30) {
+                    // Edge is on the plane
+                    section_pts.push_back(p0);
+                    section_pts.push_back(p1);
+                } else {
+                    // Compute intersection point
+                    double t = d0 / (d0 - d1);
+                    t = std::min(1.0, std::max(0.0, t));
+                    Vec3 ip = p0 + (p1 - p0) * t;
+                    section_pts.push_back(ip);
+                }
+            }
+        }
+    }
+
+    // Remove duplicate points
+    return unique_points(section_pts, tol);
+}
+
+// Compute wall-particle contact using Sutherland-Hodgman clipping
+// Returns: overlap area, contact point (in 3D), contact normal (wall normal)
+static bool compute_wall_contact(const Mesh& particle_mesh, const Transform& particle_tf,
+                                  const std::array<Vec3, 3>& wall_tri, const Vec3& wall_normal,
+                                  double particle_radius, double tol,
+                                  double& out_area, Vec3& out_contact_point, Vec3& out_normal) {
+    // Compute wall plane
+    Vec3 plane_n = wall_normal;
+    double plane_d = -dot(plane_n, wall_tri[0]);
+
+    // Get particle cross-section at wall plane
+    std::vector<Vec3> section_3d = get_particle_plane_section(particle_mesh, particle_tf,
+                                                               plane_n, plane_d, tol);
+    if (section_3d.size() < 3) {
+        return false;
+    }
+
+    // Build 2D coordinate system on wall plane
+    Vec3 basis_u, basis_v;
+    build_basis(plane_n, basis_u, basis_v);
+    Vec3 origin = wall_tri[0];
+
+    // Project particle section to 2D
+    std::vector<Vec2> subject_2d;
+    for (const auto& p : section_3d) {
+        subject_2d.push_back(project_to_2d(p, origin, basis_u, basis_v));
+    }
+
+    // Project wall triangle to 2D
+    std::vector<Vec2> clip_2d;
+    for (const auto& p : wall_tri) {
+        clip_2d.push_back(project_to_2d(p, origin, basis_u, basis_v));
+    }
+
+    // Clip particle section by wall triangle
+    std::vector<Vec2> clipped = sutherland_hodgman_clip(subject_2d, clip_2d);
+    if (clipped.size() < 3) {
+        return false;
+    }
+
+    // Compute overlap area
+    double area = polygon_area_2d(clipped);
+    if (area < tol * tol * 0.01) {
+        return false;
+    }
+
+    // Compute centroid
+    Vec2 centroid_2d = polygon_centroid_2d(clipped);
+    Vec3 contact_point = unproject_to_3d(centroid_2d, origin, basis_u, basis_v);
+
+    out_area = area;
+    out_contact_point = contact_point;
+    out_normal = plane_n;
+    return true;
+}
+
 static Vec3 support_point(const Mesh& mesh, const Transform& tf, const Vec3& dir) {
     Quat qc = quat_conj(tf.rot);
     Vec3 local_dir = quat_rotate(qc, dir);
@@ -1302,6 +1531,7 @@ struct SimConfig {
     Vec3 v0{0.0, 0.0, 0.0};
     Vec3 v1{0.0, 0.0, 0.0};
     std::vector<ParticleInit> particle_inits;
+    std::vector<WallInit> wall_inits;
 };
 
 static bool parse_config_file(const std::string& path, SimConfig& cfg) {
@@ -1312,7 +1542,9 @@ static bool parse_config_file(const std::string& path, SimConfig& cfg) {
     }
     std::string line;
     bool in_particle = false;
-    ParticleInit current;
+    bool in_wall = false;
+    ParticleInit current_particle;
+    WallInit current_wall;
     while (std::getline(in, line)) {
         if (line.empty()) {
             continue;
@@ -1336,43 +1568,80 @@ static bool parse_config_file(const std::string& path, SimConfig& cfg) {
         }
         if (key == "particle") {
             if (in_particle) {
-                cfg.particle_inits.push_back(current);
+                cfg.particle_inits.push_back(current_particle);
             }
-            current = ParticleInit{};
+            if (in_wall) {
+                cfg.wall_inits.push_back(current_wall);
+                in_wall = false;
+            }
+            current_particle = ParticleInit{};
             in_particle = true;
             continue;
         }
         if (key == "end_particle" || key == "particle_end") {
             if (in_particle) {
-                cfg.particle_inits.push_back(current);
+                cfg.particle_inits.push_back(current_particle);
                 in_particle = false;
+            }
+            continue;
+        }
+        if (key == "wall") {
+            if (in_particle) {
+                cfg.particle_inits.push_back(current_particle);
+                in_particle = false;
+            }
+            if (in_wall) {
+                cfg.wall_inits.push_back(current_wall);
+            }
+            current_wall = WallInit{};
+            in_wall = true;
+            continue;
+        }
+        if (key == "end_wall" || key == "wall_end") {
+            if (in_wall) {
+                cfg.wall_inits.push_back(current_wall);
+                in_wall = false;
             }
             continue;
         }
 
         if (in_particle) {
             if (key == "stl") {
-                iss >> current.stl_path;
+                iss >> current_particle.stl_path;
             } else if (key == "pos") {
-                iss >> current.pos.x >> current.pos.y >> current.pos.z;
+                iss >> current_particle.pos.x >> current_particle.pos.y >> current_particle.pos.z;
             } else if (key == "vel") {
-                iss >> current.vel.x >> current.vel.y >> current.vel.z;
+                iss >> current_particle.vel.x >> current_particle.vel.y >> current_particle.vel.z;
             } else if (key == "omega") {
-                iss >> current.omega.x >> current.omega.y >> current.omega.z;
+                iss >> current_particle.omega.x >> current_particle.omega.y >> current_particle.omega.z;
             } else if (key == "quat") {
-                iss >> current.rot.w >> current.rot.x >> current.rot.y >> current.rot.z;
+                iss >> current_particle.rot.w >> current_particle.rot.x >> current_particle.rot.y >> current_particle.rot.z;
             } else if (key == "scale") {
-                iss >> current.scale;
+                iss >> current_particle.scale;
             } else if (key == "density") {
-                iss >> current.density;
+                iss >> current_particle.density;
             } else if (key == "young") {
-                iss >> current.young;
+                iss >> current_particle.young;
             } else if (key == "poisson") {
-                iss >> current.poisson;
+                iss >> current_particle.poisson;
             } else if (key == "mu") {
-                iss >> current.mu;
+                iss >> current_particle.mu;
             } else if (key == "restitution") {
-                iss >> current.restitution;
+                iss >> current_particle.restitution;
+            }
+        } else if (in_wall) {
+            if (key == "stl") {
+                iss >> current_wall.stl_path;
+            } else if (key == "pos") {
+                iss >> current_wall.pos.x >> current_wall.pos.y >> current_wall.pos.z;
+            } else if (key == "quat") {
+                iss >> current_wall.rot.w >> current_wall.rot.x >> current_wall.rot.y >> current_wall.rot.z;
+            } else if (key == "scale") {
+                iss >> current_wall.scale;
+            } else if (key == "mu") {
+                iss >> current_wall.mu;
+            } else if (key == "restitution") {
+                iss >> current_wall.restitution;
             }
         } else if (key == "stl") {
             iss >> cfg.stl_path;
@@ -1411,7 +1680,10 @@ static bool parse_config_file(const std::string& path, SimConfig& cfg) {
         }
     }
     if (in_particle) {
-        cfg.particle_inits.push_back(current);
+        cfg.particle_inits.push_back(current_particle);
+    }
+    if (in_wall) {
+        cfg.wall_inits.push_back(current_wall);
     }
     if (cfg.output_interval < 1) {
         cfg.output_interval = 1;
@@ -1720,6 +1992,44 @@ int main(int argc, char** argv) {
         particles[i] = p;
     }
 
+    // Initialize walls
+    std::vector<Wall> walls;
+    for (const auto& wi : cfg.wall_inits) {
+        if (wi.stl_path.empty()) {
+            std::cerr << "Wall missing stl path.\n";
+            continue;
+        }
+        std::vector<std::array<Vec3, 3>> wall_tris;
+        if (!load_stl(wi.stl_path, wall_tris)) {
+            std::cerr << "Failed to load wall STL: " << wi.stl_path << "\n";
+            continue;
+        }
+        double scale = wi.scale > 0.0 ? wi.scale : 1.0;
+        for (auto& tri : wall_tris) {
+            tri[0] = tri[0] * scale;
+            tri[1] = tri[1] * scale;
+            tri[2] = tri[2] * scale;
+        }
+        Wall wall;
+        wall.mesh = build_mesh(wall_tris, cfg.center_mesh);
+        wall.tf.pos = wi.pos;
+        wall.tf.rot = wi.rot;
+        wall.mu = wi.mu;
+        wall.restitution = wi.restitution;
+
+        // Precompute wall triangle normals in world space
+        std::vector<std::array<Vec3, 3>> world_tris = transform_tris(wall.mesh, wall.tf);
+        wall.tri_normals.resize(world_tris.size());
+        for (std::size_t t = 0; t < world_tris.size(); ++t) {
+            wall.tri_normals[t] = tri_normal(world_tris[t]);
+        }
+        walls.push_back(wall);
+        std::cout << "Loaded wall: " << wi.stl_path << " (tris=" << wall.mesh.tris.size() << ")\n";
+    }
+
+    // Tangential displacement for wall contacts: key = (particle_idx << 16) | wall_idx
+    std::unordered_map<long long, Vec3> wall_tangential_disp;
+
     std::vector<Vec3> forces(particles.size());
     std::vector<Vec3> torques(particles.size());
     std::vector<int> contact_counts(particles.size());
@@ -2001,6 +2311,144 @@ int main(int argc, char** argv) {
             }
         }
 
+        // ============== Particle-Wall Contact Detection ==============
+        std::unordered_set<long long> active_wall_pairs;
+        for (int i = 0; i < static_cast<int>(particles.size()); ++i) {
+            Particle& p = particles[i];
+            const Mesh& pmesh = meshes[p.mesh_index];
+
+            for (int w = 0; w < static_cast<int>(walls.size()); ++w) {
+                const Wall& wall = walls[w];
+
+                // Broad phase: check if particle bounding sphere overlaps with wall bounding sphere
+                Vec3 dpos = p.tf.pos - wall.tf.pos;
+                double dist2 = dot(dpos, dpos);
+                double rsum = p.radius + wall.mesh.radius;
+                if (dist2 > rsum * rsum) {
+                    continue;
+                }
+
+                // Get transformed particle triangles
+                std::vector<std::array<Vec3, 3>> particle_tris = transform_tris(pmesh, p.tf);
+                std::vector<std::array<Vec3, 3>> wall_tris = transform_tris(wall.mesh, wall.tf);
+
+                double tol = pmesh.mean_edge > 0.0 ? (pmesh.mean_edge * 0.1) : (pmesh.bbox_diag * 1e-2);
+                if (tol <= 0.0) tol = 1e-6;
+
+                // For each wall triangle, check for contact
+                for (std::size_t t = 0; t < wall_tris.size(); ++t) {
+                    const auto& wtri = wall_tris[t];
+                    Vec3 wn = wall.tri_normals[t];
+
+                    // Quick AABB check between particle and wall triangle
+                    Vec3 wmn{std::min({wtri[0].x, wtri[1].x, wtri[2].x}),
+                             std::min({wtri[0].y, wtri[1].y, wtri[2].y}),
+                             std::min({wtri[0].z, wtri[1].z, wtri[2].z})};
+                    Vec3 wmx{std::max({wtri[0].x, wtri[1].x, wtri[2].x}),
+                             std::max({wtri[0].y, wtri[1].y, wtri[2].y}),
+                             std::max({wtri[0].z, wtri[1].z, wtri[2].z})};
+
+                    // Particle AABB
+                    Vec3 pmn = p.tf.pos - Vec3{p.radius, p.radius, p.radius};
+                    Vec3 pmx = p.tf.pos + Vec3{p.radius, p.radius, p.radius};
+
+                    if (pmx.x < wmn.x || pmn.x > wmx.x ||
+                        pmx.y < wmn.y || pmn.y > wmx.y ||
+                        pmx.z < wmn.z || pmn.z > wmx.z) {
+                        continue;
+                    }
+
+                    // Compute wall contact using Sutherland-Hodgman clipping
+                    double area;
+                    Vec3 contact_point, contact_normal;
+                    if (!compute_wall_contact(pmesh, p.tf, wtri, wn, p.radius, tol,
+                                              area, contact_point, contact_normal)) {
+                        continue;
+                    }
+
+                    // Ensure contact normal points from wall to particle (outward from wall)
+                    Vec3 to_particle = p.tf.pos - contact_point;
+                    if (dot(contact_normal, to_particle) < 0.0) {
+                        contact_normal = contact_normal * -1.0;
+                    }
+
+                    // Compute contact force
+                    Vec3 rP = contact_point - p.tf.pos;
+                    Vec3 vP = p.vel + cross(p.omega, rP);
+                    Vec3 vrel = vP;  // Wall velocity is zero
+                    double vn = dot(vrel, contact_normal);
+
+                    // Wall contact stiffness (wall is rigid, so only particle properties matter)
+                    double Rp = std::max(p.equiv_radius, 1e-12);
+                    double Ep = std::max(p.young, 1e-12);
+                    double nu_p = p.poisson;
+                    double A_n = area;
+
+                    // kn = (Ep/Rp) * An for wall contact
+                    double kn = (Ep / Rp) * A_n;
+                    // kt = (Ep/(2*(1+nu_p)*Rp)) * An
+                    double kt = (Ep / (2.0 * (1.0 + nu_p) * Rp)) * A_n;
+
+                    // Effective mass for wall contact (wall mass is infinite)
+                    double m_eff = p.mass;
+
+                    double e = p.restitution;
+                    e = std::min(0.9999, std::max(1e-6, e));
+                    double loge = std::log(e);
+                    double cn = 2.0 * loge * std::sqrt(kn * m_eff) / std::sqrt(loge * loge + 3.141592653589793 * 3.141592653589793);
+                    double ct = 2.0 * loge * std::sqrt(kt * m_eff) / std::sqrt(loge * loge + 3.141592653589793 * 3.141592653589793);
+                    cn = std::abs(cn);
+                    ct = std::abs(ct);
+
+                    // Overlap volume estimate
+                    double deltaV = std::pow(A_n, 1.5);
+
+                    // Normal force
+                    double fn = kn * std::cbrt(deltaV);
+                    if (fn < 0.0) fn = 0.0;
+                    Vec3 fn_vec = contact_normal * fn;
+
+                    // Tangential force
+                    Vec3 vt = vrel - contact_normal * vn;
+                    long long wall_pair_key = (static_cast<long long>(i) << 16) | static_cast<long long>(w);
+                    Vec3 ds = wall_tangential_disp[wall_pair_key];
+                    ds += vt * cfg.dt;
+                    ds -= contact_normal * dot(ds, contact_normal);
+                    Vec3 ft = ds * (-kt) + vt * (-ct);
+
+                    double mu = std::min(p.mu, wall.mu);
+                    double ft_norm = norm(ft);
+                    double ft_max = mu * fn;
+                    if (ft_norm > ft_max && ft_norm > 1e-14) {
+                        ft = ft * (ft_max / ft_norm);
+                        if (kt > 1e-12) {
+                            ds = ft * (-1.0 / kt);
+                        }
+                    }
+                    wall_tangential_disp[wall_pair_key] = ds;
+
+                    // Apply force to particle (wall doesn't move)
+                    Vec3 f = fn_vec + ft;
+                    forces[i] += f;
+                    torques[i] += cross(rP, f);
+
+                    active_wall_pairs.insert(wall_pair_key);
+                    contact_counts[i] += 1;
+                    contacts++;
+
+                    if (cfg.contact_debug && contacts < 3) {
+                        std::cout << "  wall_contact: particle=" << i << " wall=" << w
+                                  << " tri=" << t
+                                  << " area=" << area
+                                  << " xc=" << contact_point.x << "," << contact_point.y << "," << contact_point.z
+                                  << " n=" << contact_normal.x << "," << contact_normal.y << "," << contact_normal.z
+                                  << " F=" << f.x << "," << f.y << "," << f.z
+                                  << "\n";
+                    }
+                }
+            }
+        }
+
         for (int i = 0; i < static_cast<int>(particles.size()); ++i) {
             integrate_particle(particles[i], forces[i], torques[i], cfg.gravity, cfg.dt);
         }
@@ -2008,6 +2456,15 @@ int main(int argc, char** argv) {
         for (auto it = tangential_disp.begin(); it != tangential_disp.end(); ) {
             if (active_pairs.find(it->first) == active_pairs.end()) {
                 it = tangential_disp.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        // Clean up inactive wall contact tangential displacements
+        for (auto it = wall_tangential_disp.begin(); it != wall_tangential_disp.end(); ) {
+            if (active_wall_pairs.find(it->first) == active_wall_pairs.end()) {
+                it = wall_tangential_disp.erase(it);
             } else {
                 ++it;
             }
