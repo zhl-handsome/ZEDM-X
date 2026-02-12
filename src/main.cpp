@@ -1927,7 +1927,12 @@ int main(int argc, char** argv) {
                         double nu1 = pa.poisson;
                         double nu2 = pb.poisson;
                         double A_n = area;
+
+                        // Normal stiffness (Feng 2021 energy-conserving model)
+                        // kn = (E1/R1 + E2/R2) * An
                         double kn = (E1 / R1 + E2 / R2) * A_n;
+                        // Tangential stiffness
+                        // kt = (E1/(2*(1+nu1)*R1) + E2/(2*(1+nu2)*R2)) * An
                         double kt = (E1 / (2.0 * (1.0 + nu1) * R1) + E2 / (2.0 * (1.0 + nu2) * R2)) * A_n;
                         double m_eff = 1.0 / (pa.inv_mass + pb.inv_mass);
                         double e = std::min(pa.restitution, pb.restitution);
@@ -1938,27 +1943,17 @@ int main(int argc, char** argv) {
                         cn = std::abs(cn);
                         ct = std::abs(ct);
 
-                        double maxA = -std::numeric_limits<double>::infinity();
-                        double minB = std::numeric_limits<double>::infinity();
-                        for (const auto& tri : trisA) {
-                            maxA = std::max(maxA, dot(nA, tri[0]));
-                            maxA = std::max(maxA, dot(nA, tri[1]));
-                            maxA = std::max(maxA, dot(nA, tri[2]));
-                        }
-                        for (const auto& tri : trisB) {
-                            minB = std::min(minB, dot(nA, tri[0]));
-                            minB = std::min(minB, dot(nA, tri[1]));
-                            minB = std::min(minB, dot(nA, tri[2]));
-                        }
-                        double depth = maxA - minB;
-                        if (depth <= 0.0) {
-                            continue;
-                        }
-                        double deltaV = A_n * depth;
+                        // Estimate overlap volume from contact loop geometry
+                        // Characteristic length from contact area: Lc = sqrt(Area)
+                        // Overlap volume estimate: deltaV ≈ Area^(3/2) (assuming quasi-circular contact)
+                        double deltaV = std::pow(A_n, 1.5);
+
+                        // Normal force: Fn = kn * deltaV^(1/3)
+                        // deltaV^(1/3) ≈ Area^(1/2) acts as equivalent penetration depth
                         double fn = kn * std::cbrt(deltaV);
-                        if (vn < 0.0) {
+                         /*if (vn < 0.0) {
                             fn += -cn * vn;
-                        }
+                        }*/
                         if (fn < 0.0) fn = 0.0;
                         Vec3 fn_vec = nA * fn;
 
@@ -1981,8 +1976,8 @@ int main(int argc, char** argv) {
                         Vec3 f = fn_vec + ft;
                         forces[i] -= f;
                         forces[j] += f;
-                        torques[i] += cross(rA, f);
-                        torques[j] += cross(rB, f * -1.0);
+                        torques[i] += cross(rA, f * -1.0);
+                        torques[j] += cross(rB, f);
                         active_pairs.insert(pair_key);
                         contact_counts[i] += 1;
                         contact_counts[j] += 1;
@@ -2024,6 +2019,13 @@ int main(int argc, char** argv) {
             std::filesystem::path out_path = std::filesystem::path(cfg.output_dir) / oss.str();
             auto t_out0 = std::chrono::steady_clock::now();
             write_vtk_particles(out_path.string(), meshes, particles, forces, torques, contact_counts);
+
+            // Output particle state to txt
+            std::ostringstream oss_txt;
+            oss_txt << cfg.vtk_prefix << "_" << std::setw(6) << std::setfill('0') << step << ".txt";
+            std::filesystem::path txt_path = std::filesystem::path(cfg.output_dir) / oss_txt.str();
+            write_particle_state_txt(txt_path.string(), particles, meshes, inits);
+
             t_output += std::chrono::steady_clock::now() - t_out0;
 
             auto step_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - step_t0).count();
