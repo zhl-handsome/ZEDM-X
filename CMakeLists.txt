@@ -45,4 +45,11 @@ if(Python3_Interpreter_FOUND)
                 --exe $<TARGET_FILE:zdem_cpu>
                 --root ${CMAKE_SOURCE_DIR}
     )
+    add_test(
+        NAME wall_multiloop_regression
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_SOURCE_DIR}/tests/smoke/check_wall_multiloop_regression.py
+                --exe $<TARGET_FILE:zdem_cpu>
+                --root ${CMAKE_SOURCE_DIR}
+    )
 endif()

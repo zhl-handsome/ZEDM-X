@@ -1,0 +1,32 @@
+steps = 1
+dt = 0.00001
+split_contacts = 0
+contact_debug = 1
+gravity = 0 0 0
+center_mesh = 1
+vtk_prefix = wall_multiloop_regression
+output_dir = build/test_output/wall_multiloop_regression
+output_interval = 1
+
+wall
+stl = geometry/wall_plane.stl
+pos = 0 0 0
+quat = 1 0 0 0
+scale = 1.0
+mu = 0.5
+restitution = 0.0
+end_wall
+
+particle
+stl = geometry/two_block_particle.stl
+pos = 0 0 0
+vel = 0 0 0
+quat = 1 0 0 0
+omega = 0 0 0
+scale = 1.0
+density = 2500
+young = 1e7
+poisson = 0.25
+mu = 0.5
+restitution = 0.0
+end_particle

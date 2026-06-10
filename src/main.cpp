@@ -92,18 +92,6 @@ struct WallPatchKey {
     }
 };
 
-struct WallPatchKeyHash {
-    std::size_t operator()(const WallPatchKey& k) const {
-        std::size_t h = std::hash<int>{}(k.particle_idx);
-        h ^= std::hash<int>{}(k.wall_idx) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<int>{}(k.nx) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<int>{}(k.ny) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<int>{}(k.nz) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<int>{}(k.d) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        return h;
-    }
-};
-
 struct WallHistoryKey {
     int particle_idx = -1;
     int wall_idx = -1;
@@ -149,6 +137,7 @@ struct WallPatchAccum {
     Vec3 weighted_contact_sum{0.0, 0.0, 0.0};
     Vec3 normal_sum{0.0, 0.0, 0.0};
     int tri_count = 0;
+    int section_loop_count = 0;
 };
 
 struct WallContactCandidate {
@@ -158,6 +147,7 @@ struct WallContactCandidate {
     Vec3 contact_point{0.0, 0.0, 0.0};
     Vec3 contact_normal{0.0, 0.0, 0.0};
     std::vector<Vec3> polygon;
+    int section_loop_count = 0;
 };
 
 static bool plane_from_tri(const std::array<Vec3, 3>& tri, Vec3& n, double& d) {
@@ -444,32 +434,6 @@ static double seg_seg_dist2(const Vec3& p1, const Vec3& q1, const Vec3& p2, cons
     Vec3 cp2 = p2 + d2 * t;
     Vec3 diff = cp1 - cp2;
     return dot(diff, diff);
-}
-
-static bool polygons_connected(const std::vector<Vec3>& a, const std::vector<Vec3>& b, double tol) {
-    if (a.empty() || b.empty()) {
-        return false;
-    }
-    double tol2 = tol * tol;
-    for (const Vec3& pa : a) {
-        for (const Vec3& pb : b) {
-            if (norm2(pa - pb) <= tol2) {
-                return true;
-            }
-        }
-    }
-    for (std::size_t ia = 0; ia < a.size(); ++ia) {
-        Vec3 a0 = a[ia];
-        Vec3 a1 = a[(ia + 1) % a.size()];
-        for (std::size_t ib = 0; ib < b.size(); ++ib) {
-            Vec3 b0 = b[ib];
-            Vec3 b1 = b[(ib + 1) % b.size()];
-            if (seg_seg_dist2(a0, a1, b0, b1) <= tol2) {
-                return true;
-            }
-        }
-    }
-    return false;
 }
 
 static void label_segments_by_contact_greedy(const std::vector<std::pair<Vec3, Vec3>>& segments,
@@ -838,103 +802,111 @@ static Vec3 unproject_to_3d(const Vec2& p2d, const Vec3& origin, const Vec3& u, 
     return origin + u * p2d.x + v * p2d.y;
 }
 
-// Get particle cross-section polygon at a plane (defined by wall triangle)
-// Returns vertices of the polygon formed by intersecting particle mesh with the plane
-static std::vector<Vec3> get_particle_plane_section(const Mesh& mesh, const Transform& tf,
-                                                     const Vec3& plane_n, double plane_d,
-                                                     double tol) {
-    std::vector<Vec3> section_pts;
+static std::vector<std::vector<Vec3>> get_particle_plane_section_loops(const Mesh& mesh,
+                                                                       const Transform& tf,
+                                                                       const Vec3& plane_n,
+                                                                       double plane_d,
+                                                                       double tol) {
+    std::vector<std::pair<Vec3, Vec3>> segments;
     std::vector<std::array<Vec3, 3>> tris = transform_tris(mesh, tf);
 
     for (const auto& tri : tris) {
-        // Check each edge for intersection with plane
+        std::vector<Vec3> pts;
         for (int i = 0; i < 3; ++i) {
             int j = (i + 1) % 3;
             Vec3 p0 = tri[i];
             Vec3 p1 = tri[j];
-
             double d0 = dot(plane_n, p0) + plane_d;
             double d1 = dot(plane_n, p1) + plane_d;
+            bool on0 = std::abs(d0) <= tol;
+            bool on1 = std::abs(d1) <= tol;
 
-            // Check if edge crosses the plane
-            if (d0 * d1 < 0.0) {
-                // Edge crosses the plane - compute intersection point
+            if (on0 && on1) {
+                if (norm2(p1 - p0) > tol * tol) {
+                    segments.emplace_back(p0, p1);
+                }
+                continue;
+            }
+            if (on0) {
+                pts.push_back(p0);
+            } else if (on1) {
+                pts.push_back(p1);
+            } else if (d0 * d1 < 0.0) {
                 double t = d0 / (d0 - d1);
                 t = std::min(1.0, std::max(0.0, t));
-                Vec3 ip = p0 + (p1 - p0) * t;
-                section_pts.push_back(ip);
+                pts.push_back(p0 + (p1 - p0) * t);
+            }
+        }
+
+        pts = unique_points(pts, tol);
+        if (pts.size() == 2 && norm2(pts[1] - pts[0]) > tol * tol) {
+            segments.emplace_back(pts[0], pts[1]);
+        } else if (pts.size() > 2) {
+            for (std::size_t i = 0; i < pts.size(); ++i) {
+                for (std::size_t j = i + 1; j < pts.size(); ++j) {
+                    if (norm2(pts[j] - pts[i]) > tol * tol) {
+                        segments.emplace_back(pts[i], pts[j]);
+                    }
+                }
             }
         }
     }
 
-    // Remove duplicate points
-    return unique_points(section_pts, tol);
+    if (segments.empty()) {
+        return {};
+    }
+
+    std::vector<Vec3> V;
+    std::vector<std::pair<int, int>> edges;
+    snap_endpoints(segments, tol, V, edges);
+
+    std::vector<Vec3> V2;
+    std::vector<std::pair<int, int>> edges2;
+    split_t_junctions(V, edges, tol, V2, edges2);
+
+    std::vector<std::vector<int>> loop_vids = extract_loops(V2, edges2);
+    std::vector<std::vector<Vec3>> loops;
+    loops.reserve(loop_vids.size());
+    for (const auto& lv : loop_vids) {
+        if (lv.size() < 3) {
+            continue;
+        }
+        std::vector<Vec3> loop;
+        loop.reserve(lv.size());
+        for (int vid : lv) {
+            loop.push_back(V2[vid]);
+        }
+        loops.push_back(loop);
+    }
+    return loops;
 }
 
-// Compute wall-particle contact using Sutherland-Hodgman clipping
-// Returns: overlap area, penetration depth, contact point (in 3D), contact normal (wall normal)
-static bool compute_wall_contact(const Mesh& particle_mesh, const Transform& particle_tf,
+// Reconstruct all wall-plane section loops, then clip each loop by one wall triangle.
+static void compute_wall_contacts(const Mesh& particle_mesh, const Transform& particle_tf,
                                   const std::array<Vec3, 3>& wall_tri,
                                   double tol,
-                                  double& out_area, double& out_penetration,
-                                  Vec3& out_contact_point, Vec3& out_normal,
-                                  std::vector<Vec3>* out_polygon = nullptr) {
-    // Compute wall plane normal from transformed triangle vertices
+                                  std::vector<WallContactCandidate>& out_contacts) {
+    out_contacts.clear();
     Vec3 edge1 = wall_tri[1] - wall_tri[0];
     Vec3 edge2 = wall_tri[2] - wall_tri[0];
     Vec3 plane_n = normalize(cross(edge1, edge2));
     double plane_d = -dot(plane_n, wall_tri[0]);
 
-    // Get particle cross-section at wall plane
-    std::vector<Vec3> section_3d = get_particle_plane_section(particle_mesh, particle_tf,
-                                                               plane_n, plane_d, tol);
-
-    if (section_3d.size() < 3) {
-        return false;
+    std::vector<std::vector<Vec3>> section_loops = get_particle_plane_section_loops(
+        particle_mesh, particle_tf, plane_n, plane_d, tol);
+    if (section_loops.empty()) {
+        return;
     }
 
-    // Build 2D coordinate system on wall plane
     Vec3 basis_u, basis_v;
     build_basis(plane_n, basis_u, basis_v);
     Vec3 origin = wall_tri[0];
 
-    // Project particle section to 2D
-    std::vector<Vec2> subject_2d;
-    for (const auto& p : section_3d) {
-        subject_2d.push_back(project_to_2d(p, origin, basis_u, basis_v));
-    }
-
-    // Project wall triangle to 2D
     std::vector<Vec2> clip_2d;
     for (const auto& p : wall_tri) {
         clip_2d.push_back(project_to_2d(p, origin, basis_u, basis_v));
     }
 
-    // Clip particle section by wall triangle
-    std::vector<Vec2> clipped = sutherland_hodgman_clip(subject_2d, clip_2d);
-    if (clipped.size() < 3) {
-        return false;
-    }
-
-    // Compute overlap area
-    double area = polygon_area_2d(clipped);
-    if (area < tol * tol * 0.01) {
-        return false;
-    }
-
-    // Compute centroid
-    Vec2 centroid_2d = polygon_centroid_2d(clipped);
-    Vec3 contact_point = unproject_to_3d(centroid_2d, origin, basis_u, basis_v);
-    if (out_polygon != nullptr) {
-        out_polygon->clear();
-        out_polygon->reserve(clipped.size());
-        for (const Vec2& p2d : clipped) {
-            out_polygon->push_back(unproject_to_3d(p2d, origin, basis_u, basis_v));
-        }
-    }
-
-    // Compute penetration depth: deepest vertex penetration into wall half-space
-    // Get transformed particle vertices
     std::vector<Vec3> world_vertices;
     for (const auto& v : particle_mesh.vertices) {
         Vec3 world_v = quat_rotate(particle_tf.rot, v) + particle_tf.pos;
@@ -948,11 +920,36 @@ static bool compute_wall_contact(const Mesh& particle_mesh, const Transform& par
     }
     double penetration = std::max(0.0, -s_min);
 
-    out_area = area;
-    out_penetration = penetration;
-    out_contact_point = contact_point;
-    out_normal = plane_n;
-    return true;
+    for (const auto& loop : section_loops) {
+        std::vector<Vec2> subject_2d;
+        subject_2d.reserve(loop.size());
+        for (const auto& p : loop) {
+            subject_2d.push_back(project_to_2d(p, origin, basis_u, basis_v));
+        }
+
+        std::vector<Vec2> clipped = sutherland_hodgman_clip(subject_2d, clip_2d);
+        if (clipped.size() < 3) {
+            continue;
+        }
+
+        double area = polygon_area_2d(clipped);
+        if (area < tol * tol * 0.01) {
+            continue;
+        }
+
+        Vec2 centroid_2d = polygon_centroid_2d(clipped);
+        WallContactCandidate contact;
+        contact.area = area;
+        contact.penetration = penetration;
+        contact.contact_point = unproject_to_3d(centroid_2d, origin, basis_u, basis_v);
+        contact.contact_normal = plane_n;
+        contact.section_loop_count = static_cast<int>(section_loops.size());
+        contact.polygon.reserve(clipped.size());
+        for (const Vec2& p2d : clipped) {
+            contact.polygon.push_back(unproject_to_3d(p2d, origin, basis_u, basis_v));
+        }
+        out_contacts.push_back(contact);
+    }
 }
 
 static Vec3 support_point(const Mesh& mesh, const Transform& tf, const Vec3& dir) {
@@ -2020,8 +2017,6 @@ int main(int argc, char** argv) {
                     continue;
                 }
 
-                // Get transformed particle triangles
-                std::vector<std::array<Vec3, 3>> particle_tris = transform_tris(pmesh, p.tf);
                 std::vector<std::array<Vec3, 3>> wall_tris = transform_tris(wall.mesh, wall.tf);
 
                 double tol = pmesh.mean_edge > 0.0 ? (pmesh.mean_edge * 0.1) : (pmesh.bbox_diag * 1e-2);
@@ -2049,22 +2044,6 @@ int main(int argc, char** argv) {
                         continue;
                     }
 
-                    // Compute wall contact using Sutherland-Hodgman clipping
-                    double area, penetration;
-                    Vec3 contact_point, contact_normal;
-                    std::vector<Vec3> contact_polygon;
-                    if (!compute_wall_contact(pmesh, p.tf, wtri, tol,
-                                              area, penetration, contact_point, contact_normal,
-                                              &contact_polygon)) {
-                        continue;
-                    }
-
-                    // Ensure contact normal points from wall to particle (outward from wall)
-                    Vec3 to_particle = p.tf.pos - contact_point;
-                    if (dot(contact_normal, to_particle) < 0.0) {
-                        contact_normal = contact_normal * -1.0;
-                    }
-
                     Vec3 plane_normal = tri_normal(wtri);
                     double plane_d = -dot(plane_normal, wtri[0]);
                     const double quant = 1e6;
@@ -2076,44 +2055,29 @@ int main(int argc, char** argv) {
                     patch_key.nz = static_cast<int>(std::llround(plane_normal.z * quant));
                     patch_key.d = static_cast<int>(std::llround(plane_d * quant));
 
-                    WallContactCandidate candidate;
-                    candidate.plane_key = patch_key;
-                    candidate.area = area;
-                    candidate.penetration = penetration;
-                    candidate.contact_point = contact_point;
-                    candidate.contact_normal = contact_normal;
-                    candidate.polygon = contact_polygon;
-                    wall_candidates.push_back(candidate);
-                }
-
-                UnionFind wall_contact_uf(static_cast<int>(wall_candidates.size()));
-                double merge_tol = std::max(tol * 10.0, 1e-9);
-                for (int a = 0; a < static_cast<int>(wall_candidates.size()); ++a) {
-                    for (int b = a + 1; b < static_cast<int>(wall_candidates.size()); ++b) {
-                        if (wall_candidates[a].plane_key == wall_candidates[b].plane_key &&
-                            polygons_connected(wall_candidates[a].polygon, wall_candidates[b].polygon, merge_tol)) {
-                            wall_contact_uf.unite(a, b);
+                    std::vector<WallContactCandidate> tri_contacts;
+                    compute_wall_contacts(pmesh, p.tf, wtri, tol, tri_contacts);
+                    for (auto& candidate : tri_contacts) {
+                        Vec3 to_particle = p.tf.pos - candidate.contact_point;
+                        if (dot(candidate.contact_normal, to_particle) < 0.0) {
+                            candidate.contact_normal = candidate.contact_normal * -1.0;
                         }
+                        candidate.plane_key = patch_key;
+                        wall_candidates.push_back(candidate);
                     }
                 }
 
-                std::unordered_map<int, WallPatchAccum> wall_patch_accums;
-                std::unordered_map<int, WallPatchKey> wall_patch_keys;
-                for (int idx = 0; idx < static_cast<int>(wall_candidates.size()); ++idx) {
-                    int root = wall_contact_uf.find(idx);
-                    const WallContactCandidate& candidate = wall_candidates[idx];
-                    WallPatchAccum& accum = wall_patch_accums[root];
-                    accum.area_sum += candidate.area;
-                    accum.weighted_contact_sum += candidate.contact_point * candidate.area;
-                    accum.normal_sum += candidate.contact_normal * candidate.area;
-                    accum.penetration_max = std::max(accum.penetration_max, candidate.penetration);
-                    accum.tri_count += 1;
-                    wall_patch_keys[root] = candidate.plane_key;
-                }
-
-                for (const auto& entry : wall_patch_accums) {
-                    const WallPatchKey& patch_key = wall_patch_keys[entry.first];
-                    const WallPatchAccum& accum = entry.second;
+                if (!wall_candidates.empty()) {
+                    WallPatchKey patch_key = wall_candidates.front().plane_key;
+                    WallPatchAccum accum;
+                    for (const WallContactCandidate& candidate : wall_candidates) {
+                        accum.area_sum += candidate.area;
+                        accum.weighted_contact_sum += candidate.contact_point * candidate.area;
+                        accum.normal_sum += candidate.contact_normal * candidate.area;
+                        accum.penetration_max = std::max(accum.penetration_max, candidate.penetration);
+                        accum.tri_count += 1;
+                        accum.section_loop_count = std::max(accum.section_loop_count, candidate.section_loop_count);
+                    }
                     if (accum.area_sum <= 1e-18) {
                         continue;
                     }
@@ -2193,6 +2157,7 @@ int main(int argc, char** argv) {
                     if (cfg.contact_debug && contacts < 3) {
                         std::cout << "  wall_contact: particle=" << i << " wall=" << w
                                   << " patch_tris=" << accum.tri_count
+                                  << " section_loops=" << accum.section_loop_count
                                   << " area=" << A_n
                                   << " penetration=" << accum.penetration_max
                                   << " xc=" << contact_point.x << "," << contact_point.y << "," << contact_point.z
