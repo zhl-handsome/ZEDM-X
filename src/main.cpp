@@ -1,239 +1,29 @@
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
-#include <cctype>
-#include <fstream>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <random>
-#include <chrono>
 #include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include "core/mat3.hpp"
+#include "core/quat.hpp"
+#include "core/transform.hpp"
+#include "core/vec3.hpp"
+#include "geometry/mesh.hpp"
+#include "geometry/mesh_build.hpp"
+#include "geometry/stl_io.hpp"
 
-struct Vec3 {
-    double x = 0.0;
-    double y = 0.0;
-    double z = 0.0;
-
-    Vec3() = default;
-    Vec3(double x_, double y_, double z_) : x(x_), y(y_), z(z_) {}
-
-    Vec3 operator+(const Vec3& o) const { return Vec3{x + o.x, y + o.y, z + o.z}; }
-    Vec3 operator-(const Vec3& o) const { return Vec3{x - o.x, y - o.y, z - o.z}; }
-    Vec3 operator*(double s) const { return Vec3{x * s, y * s, z * s}; }
-    Vec3 operator/(double s) const { return Vec3{x / s, y / s, z / s}; }
-
-    Vec3& operator+=(const Vec3& o) { x += o.x; y += o.y; z += o.z; return *this; }
-    Vec3& operator-=(const Vec3& o) { x -= o.x; y -= o.y; z -= o.z; return *this; }
-    Vec3& operator*=(double s) { x *= s; y *= s; z *= s; return *this; }
-};
-
-static inline double dot(const Vec3& a, const Vec3& b) {
-    return a.x * b.x + a.y * b.y + a.z * b.z;
-}
-
-static inline Vec3 cross(const Vec3& a, const Vec3& b) {
-    return Vec3{
-        a.y * b.z - a.z * b.y,
-        a.z * b.x - a.x * b.z,
-        a.x * b.y - a.y * b.x,
-    };
-}
-
-static inline double norm(const Vec3& v) {
-    return std::sqrt(dot(v, v));
-}
-
-static inline Vec3 normalize(const Vec3& v) {
-    double n = norm(v);
-    if (n < 1e-14) {
-        return Vec3{0.0, 0.0, 0.0};
-    }
-    return v / n;
-}
-
-static inline double norm2(const Vec3& v) {
-    return dot(v, v);
-}
-
-struct Quat {
-    double w = 1.0;
-    double x = 0.0;
-    double y = 0.0;
-    double z = 0.0;
-};
-
-static inline Quat quat_conj(const Quat& q) {
-    return Quat{q.w, -q.x, -q.y, -q.z};
-}
-
-static inline Quat quat_mul(const Quat& a, const Quat& b) {
-    return Quat{
-        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
-        a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
-        a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
-        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
-    };
-}
-
-static inline Quat quat_normalize(const Quat& q) {
-    double n = std::sqrt(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
-    if (n < 1e-14) {
-        return Quat{};
-    }
-    return Quat{q.w / n, q.x / n, q.y / n, q.z / n};
-}
-
-static inline Vec3 quat_rotate(const Quat& q, const Vec3& v) {
-    Quat p{0.0, v.x, v.y, v.z};
-    Quat qn = quat_normalize(q);
-    Quat r = quat_mul(quat_mul(qn, p), quat_conj(qn));
-    return Vec3{r.x, r.y, r.z};
-}
-
-struct Mat3 {
-    double m[3][3] = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}};
-};
-
-static inline Mat3 mat3_identity() {
-    Mat3 r;
-    r.m[0][0] = 1.0;
-    r.m[1][1] = 1.0;
-    r.m[2][2] = 1.0;
-    return r;
-}
-
-static inline Mat3 mat3_add(const Mat3& a, const Mat3& b) {
-    Mat3 r;
-    for (int i = 0; i < 3; ++i) {
-        for (int j = 0; j < 3; ++j) {
-            r.m[i][j] = a.m[i][j] + b.m[i][j];
-        }
-    }
-    return r;
-}
-
-static inline Mat3 mat3_sub(const Mat3& a, const Mat3& b) {
-    Mat3 r;
-    for (int i = 0; i < 3; ++i) {
-        for (int j = 0; j < 3; ++j) {
-            r.m[i][j] = a.m[i][j] - b.m[i][j];
-        }
-    }
-    return r;
-}
-
-static inline Mat3 mat3_scale(const Mat3& a, double s) {
-    Mat3 r;
-    for (int i = 0; i < 3; ++i) {
-        for (int j = 0; j < 3; ++j) {
-            r.m[i][j] = a.m[i][j] * s;
-        }
-    }
-    return r;
-}
-
-static inline Mat3 mat3_outer(const Vec3& a, const Vec3& b) {
-    Mat3 r;
-    r.m[0][0] = a.x * b.x; r.m[0][1] = a.x * b.y; r.m[0][2] = a.x * b.z;
-    r.m[1][0] = a.y * b.x; r.m[1][1] = a.y * b.y; r.m[1][2] = a.y * b.z;
-    r.m[2][0] = a.z * b.x; r.m[2][1] = a.z * b.y; r.m[2][2] = a.z * b.z;
-    return r;
-}
-
-static inline Mat3 quat_to_mat3(const Quat& q) {
-    Quat n = quat_normalize(q);
-    double w = n.w, x = n.x, y = n.y, z = n.z;
-    Mat3 R;
-    R.m[0][0] = 1.0 - 2.0 * (y * y + z * z);
-    R.m[0][1] = 2.0 * (x * y - z * w);
-    R.m[0][2] = 2.0 * (x * z + y * w);
-    R.m[1][0] = 2.0 * (x * y + z * w);
-    R.m[1][1] = 1.0 - 2.0 * (x * x + z * z);
-    R.m[1][2] = 2.0 * (y * z - x * w);
-    R.m[2][0] = 2.0 * (x * z - y * w);
-    R.m[2][1] = 2.0 * (y * z + x * w);
-    R.m[2][2] = 1.0 - 2.0 * (x * x + y * y);
-    return R;
-}
-
-static inline Vec3 mat3_mul_vec3(const Mat3& m, const Vec3& v) {
-    return Vec3{
-        m.m[0][0] * v.x + m.m[0][1] * v.y + m.m[0][2] * v.z,
-        m.m[1][0] * v.x + m.m[1][1] * v.y + m.m[1][2] * v.z,
-        m.m[2][0] * v.x + m.m[2][1] * v.y + m.m[2][2] * v.z,
-    };
-}
-
-static inline Mat3 mat3_mul(const Mat3& a, const Mat3& b) {
-    Mat3 r;
-    for (int i = 0; i < 3; ++i) {
-        for (int j = 0; j < 3; ++j) {
-            r.m[i][j] = 0.0;
-            for (int k = 0; k < 3; ++k) {
-                r.m[i][j] += a.m[i][k] * b.m[k][j];
-            }
-        }
-    }
-    return r;
-}
-
-static inline Mat3 mat3_transpose(const Mat3& m) {
-    Mat3 r;
-    for (int i = 0; i < 3; ++i) {
-        for (int j = 0; j < 3; ++j) {
-            r.m[i][j] = m.m[j][i];
-        }
-    }
-    return r;
-}
-
-static inline double mat3_det(const Mat3& a) {
-    return a.m[0][0] * (a.m[1][1] * a.m[2][2] - a.m[1][2] * a.m[2][1])
-         - a.m[0][1] * (a.m[1][0] * a.m[2][2] - a.m[1][2] * a.m[2][0])
-         + a.m[0][2] * (a.m[1][0] * a.m[2][1] - a.m[1][1] * a.m[2][0]);
-}
-
-static inline Mat3 mat3_inverse(const Mat3& a) {
-    double det = mat3_det(a);
-    if (std::abs(det) < 1e-18) {
-        return mat3_identity();
-    }
-    double invdet = 1.0 / det;
-    Mat3 r;
-    r.m[0][0] =  (a.m[1][1] * a.m[2][2] - a.m[1][2] * a.m[2][1]) * invdet;
-    r.m[0][1] = -(a.m[0][1] * a.m[2][2] - a.m[0][2] * a.m[2][1]) * invdet;
-    r.m[0][2] =  (a.m[0][1] * a.m[1][2] - a.m[0][2] * a.m[1][1]) * invdet;
-    r.m[1][0] = -(a.m[1][0] * a.m[2][2] - a.m[1][2] * a.m[2][0]) * invdet;
-    r.m[1][1] =  (a.m[0][0] * a.m[2][2] - a.m[0][2] * a.m[2][0]) * invdet;
-    r.m[1][2] = -(a.m[0][0] * a.m[1][2] - a.m[0][2] * a.m[1][0]) * invdet;
-    r.m[2][0] =  (a.m[1][0] * a.m[2][1] - a.m[1][1] * a.m[2][0]) * invdet;
-    r.m[2][1] = -(a.m[0][0] * a.m[2][1] - a.m[0][1] * a.m[2][0]) * invdet;
-    r.m[2][2] =  (a.m[0][0] * a.m[1][1] - a.m[0][1] * a.m[1][0]) * invdet;
-    return r;
-}
-
-struct Transform {
-    Vec3 pos;
-    Quat rot;
-};
-
-struct Mesh {
-    std::vector<Vec3> vertices;
-    std::vector<std::array<Vec3, 3>> tris;
-    Vec3 center;
-    double radius = 0.0;
-    double mean_edge = 0.0;
-    double bbox_diag = 0.0;
-    double volume = 0.0;
-    Mat3 inertia_unit;
-};
+using namespace zdem;
 
 struct ParticleInit {
     std::string stl_path;
@@ -284,236 +74,43 @@ struct Wall {
     std::vector<Vec3> tri_normals;
 };
 
-static std::vector<Vec3> unique_vertices(const std::vector<std::array<Vec3, 3>>& tris) {
-    std::vector<Vec3> verts;
-    const double tol = 1e-10;
-    for (const auto& tri : tris) {
-        for (const auto& v : tri) {
-            bool found = false;
-            for (const auto& u : verts) {
-                Vec3 d = v - u;
-                if (dot(d, d) <= tol) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                verts.push_back(v);
-            }
-        }
+struct WallPatchKey {
+    int particle_idx = -1;
+    int wall_idx = -1;
+    int nx = 0;
+    int ny = 0;
+    int nz = 0;
+    int d = 0;
+
+    bool operator==(const WallPatchKey& o) const {
+        return particle_idx == o.particle_idx &&
+               wall_idx == o.wall_idx &&
+               nx == o.nx &&
+               ny == o.ny &&
+               nz == o.nz &&
+               d == o.d;
     }
-    return verts;
-}
+};
 
-static bool load_stl(const std::string& path, std::vector<std::array<Vec3, 3>>& tris) {
-    tris.clear();
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
-        return false;
+struct WallPatchKeyHash {
+    std::size_t operator()(const WallPatchKey& k) const {
+        std::size_t h = std::hash<int>{}(k.particle_idx);
+        h ^= std::hash<int>{}(k.wall_idx) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(k.nx) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(k.ny) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(k.nz) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(k.d) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
     }
+};
 
-    in.seekg(0, std::ios::end);
-    std::streampos size = in.tellg();
-    in.seekg(0, std::ios::beg);
-    if (size < 84) {
-        return false;
-    }
-
-    std::array<char, 80> header{};
-    in.read(header.data(), header.size());
-    uint32_t n_tri = 0;
-    in.read(reinterpret_cast<char*>(&n_tri), sizeof(uint32_t));
-
-    std::streampos expected = 84 + static_cast<std::streampos>(n_tri) * 50;
-    if (expected == size) {
-        tris.reserve(n_tri);
-        for (uint32_t i = 0; i < n_tri; ++i) {
-            float data[12];
-            uint16_t attr = 0;
-            in.read(reinterpret_cast<char*>(data), sizeof(float) * 12);
-            in.read(reinterpret_cast<char*>(&attr), sizeof(uint16_t));
-            std::array<Vec3, 3> tri{
-                Vec3{data[3], data[4], data[5]},
-                Vec3{data[6], data[7], data[8]},
-                Vec3{data[9], data[10], data[11]}
-            };
-            tris.push_back(tri);
-        }
-        return true;
-    }
-
-    in.close();
-    std::ifstream ia(path);
-    if (!ia) {
-        return false;
-    }
-    std::string line;
-    std::vector<Vec3> vbuf;
-    while (std::getline(ia, line)) {
-        std::string s = line;
-        for (auto& c : s) {
-            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        }
-        if (s.find("vertex") != std::string::npos) {
-            std::istringstream iss(s);
-            std::string tag;
-            double x, y, z;
-            if (iss >> tag >> x >> y >> z) {
-                vbuf.emplace_back(x, y, z);
-            }
-        }
-        if (s.find("endloop") != std::string::npos && vbuf.size() >= 3) {
-            std::array<Vec3, 3> tri{vbuf[vbuf.size() - 3], vbuf[vbuf.size() - 2], vbuf[vbuf.size() - 1]};
-            tris.push_back(tri);
-        }
-    }
-    return !tris.empty();
-}
-
-static void compute_mass_properties(const std::vector<std::array<Vec3, 3>>& tris,
-                                    double& out_volume,
-                                    Vec3& out_centroid,
-                                    Mat3& out_inertia) {
-    double det_sum = 0.0;
-    Vec3 csum{0.0, 0.0, 0.0};
-    double Ixx = 0.0, Iyy = 0.0, Izz = 0.0;
-    double Ixy = 0.0, Ixz = 0.0, Iyz = 0.0;
-
-    for (const auto& tri : tris) {
-        Vec3 a = tri[0];
-        Vec3 b = tri[1];
-        Vec3 c = tri[2];
-        double det = dot(a, cross(b, c));
-        det_sum += det;
-        csum += (a + b + c) * det;
-
-        double x1 = a.x, x2 = b.x, x3 = c.x;
-        double y1 = a.y, y2 = b.y, y3 = c.y;
-        double z1 = a.z, z2 = b.z, z3 = c.z;
-
-        double f2x = x1 * x1 + x2 * x2 + x3 * x3 + x1 * x2 + x1 * x3 + x2 * x3;
-        double f2y = y1 * y1 + y2 * y2 + y3 * y3 + y1 * y2 + y1 * y3 + y2 * y3;
-        double f2z = z1 * z1 + z2 * z2 + z3 * z3 + z1 * z2 + z1 * z3 + z2 * z3;
-
-        Ixx += det * (f2y + f2z);
-        Iyy += det * (f2x + f2z);
-        Izz += det * (f2x + f2y);
-
-        double gxy = 2.0 * x1 * y1 + 2.0 * x2 * y2 + 2.0 * x3 * y3
-                   + x1 * y2 + x2 * y1 + x1 * y3 + x3 * y1 + x2 * y3 + x3 * y2;
-        double gxz = 2.0 * x1 * z1 + 2.0 * x2 * z2 + 2.0 * x3 * z3
-                   + x1 * z2 + x2 * z1 + x1 * z3 + x3 * z1 + x2 * z3 + x3 * z2;
-        double gyz = 2.0 * y1 * z1 + 2.0 * y2 * z2 + 2.0 * y3 * z3
-                   + y1 * z2 + y2 * z1 + y1 * z3 + y3 * z1 + y2 * z3 + y3 * z2;
-        Ixy += det * gxy;
-        Ixz += det * gxz;
-        Iyz += det * gyz;
-    }
-
-    if (std::abs(det_sum) < 1e-18) {
-        out_volume = 0.0;
-        out_centroid = Vec3{0.0, 0.0, 0.0};
-        out_inertia = Mat3{};
-        return;
-    }
-
-    if (det_sum < 0.0) {
-        det_sum = -det_sum;
-        csum *= -1.0;
-        Ixx *= -1.0; Iyy *= -1.0; Izz *= -1.0;
-        Ixy *= -1.0; Ixz *= -1.0; Iyz *= -1.0;
-    }
-
-    out_volume = det_sum / 6.0;
-    out_centroid = csum / (4.0 * det_sum);
-
-    Ixx /= 60.0;
-    Iyy /= 60.0;
-    Izz /= 60.0;
-    Ixy /= -120.0;
-    Ixz /= -120.0;
-    Iyz /= -120.0;
-
-    Mat3 I;
-    I.m[0][0] = Ixx; I.m[1][1] = Iyy; I.m[2][2] = Izz;
-    I.m[0][1] = Ixy; I.m[1][0] = Ixy;
-    I.m[0][2] = Ixz; I.m[2][0] = Ixz;
-    I.m[1][2] = Iyz; I.m[2][1] = Iyz;
-    out_inertia = I;
-}
-
-static Mesh build_mesh(const std::vector<std::array<Vec3, 3>>& tris, bool center_mesh) {
-    Mesh m;
-    m.vertices = unique_vertices(tris);
-    m.tris = tris;
-    Vec3 centroid{0.0, 0.0, 0.0};
-    Mat3 inertia_origin;
-    compute_mass_properties(m.tris, m.volume, centroid, inertia_origin);
-    m.center = centroid;
-    Mat3 inertia_cm = inertia_origin;
-    if (m.volume > 0.0) {
-        Mat3 shift = mat3_sub(mat3_scale(mat3_identity(), dot(centroid, centroid)), mat3_outer(centroid, centroid));
-        inertia_cm = mat3_sub(inertia_origin, mat3_scale(shift, m.volume));
-    }
-    if (center_mesh) {
-        for (auto& v : m.vertices) {
-            v -= centroid;
-        }
-        for (auto& tri : m.tris) {
-            tri[0] -= centroid;
-            tri[1] -= centroid;
-            tri[2] -= centroid;
-        }
-        m.center = Vec3{0.0, 0.0, 0.0};
-    }
-    m.inertia_unit = inertia_cm;
-    double r2 = 0.0;
-    Vec3 mn{std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity()};
-    Vec3 mx{-std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity()};
-    for (const auto& v : m.vertices) {
-        r2 = std::max(r2, dot(v, v));
-        mn.x = std::min(mn.x, v.x);
-        mn.y = std::min(mn.y, v.y);
-        mn.z = std::min(mn.z, v.z);
-        mx.x = std::max(mx.x, v.x);
-        mx.y = std::max(mx.y, v.y);
-        mx.z = std::max(mx.z, v.z);
-    }
-    m.radius = std::sqrt(r2);
-    m.bbox_diag = norm(mx - mn);
-
-    double edge_sum = 0.0;
-    std::size_t edge_cnt = 0;
-    for (const auto& tri : m.tris) {
-        edge_sum += norm(tri[1] - tri[0]);
-        edge_sum += norm(tri[2] - tri[1]);
-        edge_sum += norm(tri[0] - tri[2]);
-        edge_cnt += 3;
-    }
-    if (edge_cnt > 0) {
-        m.mean_edge = edge_sum / static_cast<double>(edge_cnt);
-    }
-    return m;
-}
-
-static std::vector<std::array<Vec3, 3>> transform_tris(const Mesh& mesh, const Transform& tf) {
-    std::vector<std::array<Vec3, 3>> out;
-    out.reserve(mesh.tris.size());
-    for (const auto& tri : mesh.tris) {
-        std::array<Vec3, 3> t;
-        t[0] = quat_rotate(tf.rot, tri[0]) + tf.pos;
-        t[1] = quat_rotate(tf.rot, tri[1]) + tf.pos;
-        t[2] = quat_rotate(tf.rot, tri[2]) + tf.pos;
-        out.push_back(t);
-    }
-    return out;
-}
-
-static Vec3 tri_normal(const std::array<Vec3, 3>& tri) {
-    Vec3 e1 = tri[1] - tri[0];
-    Vec3 e2 = tri[2] - tri[0];
-    return normalize(cross(e1, e2));
-}
+struct WallPatchAccum {
+    double area_sum = 0.0;
+    double penetration_max = 0.0;
+    Vec3 weighted_contact_sum{0.0, 0.0, 0.0};
+    Vec3 normal_sum{0.0, 0.0, 0.0};
+    int tri_count = 0;
+};
 
 static bool plane_from_tri(const std::array<Vec3, 3>& tri, Vec3& n, double& d) {
     n = cross(tri[1] - tri[0], tri[2] - tri[0]);
@@ -1201,13 +798,16 @@ static std::vector<Vec3> get_particle_plane_section(const Mesh& mesh, const Tran
 }
 
 // Compute wall-particle contact using Sutherland-Hodgman clipping
-// Returns: overlap area, contact point (in 3D), contact normal (wall normal)
+// Returns: overlap area, penetration depth, contact point (in 3D), contact normal (wall normal)
 static bool compute_wall_contact(const Mesh& particle_mesh, const Transform& particle_tf,
-                                  const std::array<Vec3, 3>& wall_tri, const Vec3& wall_normal,
-                                  double particle_radius, double tol,
-                                  double& out_area, Vec3& out_contact_point, Vec3& out_normal) {
-    // Compute wall plane
-    Vec3 plane_n = wall_normal;
+                                  const std::array<Vec3, 3>& wall_tri,
+                                  double tol,
+                                  double& out_area, double& out_penetration,
+                                  Vec3& out_contact_point, Vec3& out_normal) {
+    // Compute wall plane normal from transformed triangle vertices
+    Vec3 edge1 = wall_tri[1] - wall_tri[0];
+    Vec3 edge2 = wall_tri[2] - wall_tri[0];
+    Vec3 plane_n = normalize(cross(edge1, edge2));
     double plane_d = -dot(plane_n, wall_tri[0]);
 
     // Get particle cross-section at wall plane
@@ -1251,7 +851,23 @@ static bool compute_wall_contact(const Mesh& particle_mesh, const Transform& par
     Vec2 centroid_2d = polygon_centroid_2d(clipped);
     Vec3 contact_point = unproject_to_3d(centroid_2d, origin, basis_u, basis_v);
 
+    // Compute penetration depth: deepest vertex penetration into wall half-space
+    // Get transformed particle vertices
+    std::vector<Vec3> world_vertices;
+    for (const auto& v : particle_mesh.vertices) {
+        Vec3 world_v = quat_rotate(particle_tf.rot, v) + particle_tf.pos;
+        world_vertices.push_back(world_v);
+    }
+
+    double s_min = std::numeric_limits<double>::infinity();
+    for (const Vec3& v_world : world_vertices) {
+        double s = dot(plane_n, v_world) + plane_d;
+        s_min = std::min(s_min, s);
+    }
+    double penetration = std::max(0.0, -s_min);
+
     out_area = area;
+    out_penetration = penetration;
     out_contact_point = contact_point;
     out_normal = plane_n;
     return true;
@@ -2313,6 +1929,7 @@ int main(int argc, char** argv) {
 
             for (int w = 0; w < static_cast<int>(walls.size()); ++w) {
                 const Wall& wall = walls[w];
+                std::unordered_map<WallPatchKey, WallPatchAccum, WallPatchKeyHash> wall_patch_accums;
 
                 // Broad phase: check if particle bounding sphere overlaps with wall bounding sphere
                 Vec3 dpos = p.tf.pos - wall.tf.pos;
@@ -2332,7 +1949,6 @@ int main(int argc, char** argv) {
                 // For each wall triangle, check for contact
                 for (std::size_t t = 0; t < wall_tris.size(); ++t) {
                     const auto& wtri = wall_tris[t];
-                    Vec3 wn = wall.tri_normals[t];
 
                     // Quick AABB check between particle and wall triangle
                     Vec3 wmn{std::min({wtri[0].x, wtri[1].x, wtri[2].x}),
@@ -2353,10 +1969,10 @@ int main(int argc, char** argv) {
                     }
 
                     // Compute wall contact using Sutherland-Hodgman clipping
-                    double area;
+                    double area, penetration;
                     Vec3 contact_point, contact_normal;
-                    if (!compute_wall_contact(pmesh, p.tf, wtri, wn, p.radius, tol,
-                                              area, contact_point, contact_normal)) {
+                    if (!compute_wall_contact(pmesh, p.tf, wtri, tol,
+                                              area, penetration, contact_point, contact_normal)) {
                         continue;
                     }
 
@@ -2366,26 +1982,52 @@ int main(int argc, char** argv) {
                         contact_normal = contact_normal * -1.0;
                     }
 
-                    // Compute contact force
+                    Vec3 plane_normal = tri_normal(wtri);
+                    double plane_d = -dot(plane_normal, wtri[0]);
+                    const double quant = 1e6;
+                    WallPatchKey patch_key;
+                    patch_key.particle_idx = i;
+                    patch_key.wall_idx = w;
+                    patch_key.nx = static_cast<int>(std::llround(plane_normal.x * quant));
+                    patch_key.ny = static_cast<int>(std::llround(plane_normal.y * quant));
+                    patch_key.nz = static_cast<int>(std::llround(plane_normal.z * quant));
+                    patch_key.d = static_cast<int>(std::llround(plane_d * quant));
+
+                    WallPatchAccum& accum = wall_patch_accums[patch_key];
+                    accum.area_sum += area;
+                    accum.weighted_contact_sum += contact_point * area;
+                    accum.normal_sum += contact_normal * area;
+                    accum.penetration_max = std::max(accum.penetration_max, penetration);
+                    accum.tri_count += 1;
+                }
+
+                for (const auto& entry : wall_patch_accums) {
+                    const WallPatchKey& patch_key = entry.first;
+                    const WallPatchAccum& accum = entry.second;
+                    if (accum.area_sum <= 1e-18) {
+                        continue;
+                    }
+
+                    Vec3 contact_normal = normalize(accum.normal_sum);
+                    if (norm2(contact_normal) < 1e-20) {
+                        continue;
+                    }
+                    Vec3 contact_point = accum.weighted_contact_sum / accum.area_sum;
+
                     Vec3 rP = contact_point - p.tf.pos;
                     Vec3 vP = p.vel + cross(p.omega, rP);
                     Vec3 vrel = vP;  // Wall velocity is zero
                     double vn = dot(vrel, contact_normal);
 
-                    // Wall contact stiffness (wall is rigid, so only particle properties matter)
                     double Rp = std::max(p.equiv_radius, 1e-12);
                     double Ep = std::max(p.young, 1e-12);
                     double nu_p = p.poisson;
-                    double A_n = area;
+                    double A_n = accum.area_sum;
 
-                    // kn = (Ep/Rp) * An for wall contact
                     double kn = (Ep / Rp) * A_n;
-                    // kt = (Ep/(2*(1+nu_p)*Rp)) * An
                     double kt = (Ep / (2.0 * (1.0 + nu_p) * Rp)) * A_n;
 
-                    // Effective mass for wall contact (wall mass is infinite)
                     double m_eff = p.mass;
-
                     double e = p.restitution;
                     e = std::min(0.9999, std::max(1e-6, e));
                     double loge = std::log(e);
@@ -2394,20 +2036,18 @@ int main(int argc, char** argv) {
                     cn = std::abs(cn);
                     ct = std::abs(ct);
 
-                    // Normal force using overlap area (Feng 2021 energy-conserving model)
-                    // Elastic: F_n^e = k_n * deltaV^(1/3) * n
-                    // Damping: F_n^d = -c_n * (v_r · n) * n
-                    // Total: F_n = F_n^e + F_n^d
-                    double deltaV = std::pow(A_n, 1.5);
-                    double fn_elastic = kn * std::cbrt(deltaV);
-                    double fn_damping = -cn * vn;
+                    // Use the clipped contact area and deepest plane penetration to approximate overlap volume.
+                    double deltaV = A_n * std::max(accum.penetration_max, 0.0);
+                    double fn_elastic = (deltaV > 0.0) ? (kn * std::cbrt(deltaV)) : 0.0;
+                    double fn_damping = (vn < 0.0) ? (-cn * vn) : 0.0;
                     double fn = fn_elastic + fn_damping;
                     if (fn < 0.0) fn = 0.0;
                     Vec3 fn_vec = contact_normal * fn;
 
-                    // Tangential force
                     Vec3 vt = vrel - contact_normal * vn;
-                    long long wall_pair_key = (static_cast<long long>(i) << 16) | static_cast<long long>(w);
+                    long long wall_pair_key = (static_cast<long long>(patch_key.particle_idx) << 32)
+                                            ^ (static_cast<long long>(patch_key.wall_idx & 0xffff) << 16)
+                                            ^ static_cast<unsigned int>((patch_key.d ^ patch_key.nz ^ patch_key.ny ^ patch_key.nx) & 0xffff);
                     Vec3 ds = wall_tangential_disp[wall_pair_key];
                     ds += vt * cfg.dt;
                     ds -= contact_normal * dot(ds, contact_normal);
@@ -2424,7 +2064,6 @@ int main(int argc, char** argv) {
                     }
                     wall_tangential_disp[wall_pair_key] = ds;
 
-                    // Apply force to particle (wall doesn't move)
                     Vec3 f = fn_vec + ft;
                     forces[i] += f;
                     torques[i] += cross(rP, f);
@@ -2435,8 +2074,9 @@ int main(int argc, char** argv) {
 
                     if (cfg.contact_debug && contacts < 3) {
                         std::cout << "  wall_contact: particle=" << i << " wall=" << w
-                                  << " tri=" << t
-                                  << " area=" << area
+                                  << " patch_tris=" << accum.tri_count
+                                  << " area=" << A_n
+                                  << " penetration=" << accum.penetration_max
                                   << " xc=" << contact_point.x << "," << contact_point.y << "," << contact_point.z
                                   << " n=" << contact_normal.x << "," << contact_normal.y << "," << contact_normal.z
                                   << " F=" << f.x << "," << f.y << "," << f.z
