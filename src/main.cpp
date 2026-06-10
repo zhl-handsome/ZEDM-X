@@ -104,12 +104,60 @@ struct WallPatchKeyHash {
     }
 };
 
+struct WallHistoryKey {
+    int particle_idx = -1;
+    int wall_idx = -1;
+    int nx = 0;
+    int ny = 0;
+    int nz = 0;
+    int d = 0;
+    int cx = 0;
+    int cy = 0;
+    int cz = 0;
+
+    bool operator==(const WallHistoryKey& o) const {
+        return particle_idx == o.particle_idx &&
+               wall_idx == o.wall_idx &&
+               nx == o.nx &&
+               ny == o.ny &&
+               nz == o.nz &&
+               d == o.d &&
+               cx == o.cx &&
+               cy == o.cy &&
+               cz == o.cz;
+    }
+};
+
+struct WallHistoryKeyHash {
+    std::size_t operator()(const WallHistoryKey& k) const {
+        std::size_t h = std::hash<int>{}(k.particle_idx);
+        h ^= std::hash<int>{}(k.wall_idx) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(k.nx) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(k.ny) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(k.nz) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(k.d) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(k.cx) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(k.cy) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(k.cz) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
 struct WallPatchAccum {
     double area_sum = 0.0;
     double penetration_max = 0.0;
     Vec3 weighted_contact_sum{0.0, 0.0, 0.0};
     Vec3 normal_sum{0.0, 0.0, 0.0};
     int tri_count = 0;
+};
+
+struct WallContactCandidate {
+    WallPatchKey plane_key;
+    double area = 0.0;
+    double penetration = 0.0;
+    Vec3 contact_point{0.0, 0.0, 0.0};
+    Vec3 contact_normal{0.0, 0.0, 0.0};
+    std::vector<Vec3> polygon;
 };
 
 static bool plane_from_tri(const std::array<Vec3, 3>& tri, Vec3& n, double& d) {
@@ -396,6 +444,32 @@ static double seg_seg_dist2(const Vec3& p1, const Vec3& q1, const Vec3& p2, cons
     Vec3 cp2 = p2 + d2 * t;
     Vec3 diff = cp1 - cp2;
     return dot(diff, diff);
+}
+
+static bool polygons_connected(const std::vector<Vec3>& a, const std::vector<Vec3>& b, double tol) {
+    if (a.empty() || b.empty()) {
+        return false;
+    }
+    double tol2 = tol * tol;
+    for (const Vec3& pa : a) {
+        for (const Vec3& pb : b) {
+            if (norm2(pa - pb) <= tol2) {
+                return true;
+            }
+        }
+    }
+    for (std::size_t ia = 0; ia < a.size(); ++ia) {
+        Vec3 a0 = a[ia];
+        Vec3 a1 = a[(ia + 1) % a.size()];
+        for (std::size_t ib = 0; ib < b.size(); ++ib) {
+            Vec3 b0 = b[ib];
+            Vec3 b1 = b[(ib + 1) % b.size()];
+            if (seg_seg_dist2(a0, a1, b0, b1) <= tol2) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 static void label_segments_by_contact_greedy(const std::vector<std::pair<Vec3, Vec3>>& segments,
@@ -803,7 +877,8 @@ static bool compute_wall_contact(const Mesh& particle_mesh, const Transform& par
                                   const std::array<Vec3, 3>& wall_tri,
                                   double tol,
                                   double& out_area, double& out_penetration,
-                                  Vec3& out_contact_point, Vec3& out_normal) {
+                                  Vec3& out_contact_point, Vec3& out_normal,
+                                  std::vector<Vec3>* out_polygon = nullptr) {
     // Compute wall plane normal from transformed triangle vertices
     Vec3 edge1 = wall_tri[1] - wall_tri[0];
     Vec3 edge2 = wall_tri[2] - wall_tri[0];
@@ -850,6 +925,13 @@ static bool compute_wall_contact(const Mesh& particle_mesh, const Transform& par
     // Compute centroid
     Vec2 centroid_2d = polygon_centroid_2d(clipped);
     Vec3 contact_point = unproject_to_3d(centroid_2d, origin, basis_u, basis_v);
+    if (out_polygon != nullptr) {
+        out_polygon->clear();
+        out_polygon->reserve(clipped.size());
+        for (const Vec2& p2d : clipped) {
+            out_polygon->push_back(unproject_to_3d(p2d, origin, basis_u, basis_v));
+        }
+    }
 
     // Compute penetration depth: deepest vertex penetration into wall half-space
     // Get transformed particle vertices
@@ -1637,8 +1719,7 @@ int main(int argc, char** argv) {
         std::cout << "Loaded wall: " << wi.stl_path << " (tris=" << wall.mesh.tris.size() << ")\n";
     }
 
-    // Tangential displacement for wall contacts: key = (particle_idx << 16) | wall_idx
-    std::unordered_map<long long, Vec3> wall_tangential_disp;
+    std::unordered_map<WallHistoryKey, Vec3, WallHistoryKeyHash> wall_tangential_disp;
 
     std::vector<Vec3> forces(particles.size());
     std::vector<Vec3> torques(particles.size());
@@ -1922,14 +2003,14 @@ int main(int argc, char** argv) {
         }
 
         // ============== Particle-Wall Contact Detection ==============
-        std::unordered_set<long long> active_wall_pairs;
+        std::unordered_set<WallHistoryKey, WallHistoryKeyHash> active_wall_pairs;
         for (int i = 0; i < static_cast<int>(particles.size()); ++i) {
             Particle& p = particles[i];
             const Mesh& pmesh = meshes[p.mesh_index];
 
             for (int w = 0; w < static_cast<int>(walls.size()); ++w) {
                 const Wall& wall = walls[w];
-                std::unordered_map<WallPatchKey, WallPatchAccum, WallPatchKeyHash> wall_patch_accums;
+                std::vector<WallContactCandidate> wall_candidates;
 
                 // Broad phase: check if particle bounding sphere overlaps with wall bounding sphere
                 Vec3 dpos = p.tf.pos - wall.tf.pos;
@@ -1971,8 +2052,10 @@ int main(int argc, char** argv) {
                     // Compute wall contact using Sutherland-Hodgman clipping
                     double area, penetration;
                     Vec3 contact_point, contact_normal;
+                    std::vector<Vec3> contact_polygon;
                     if (!compute_wall_contact(pmesh, p.tf, wtri, tol,
-                                              area, penetration, contact_point, contact_normal)) {
+                                              area, penetration, contact_point, contact_normal,
+                                              &contact_polygon)) {
                         continue;
                     }
 
@@ -1993,16 +2076,43 @@ int main(int argc, char** argv) {
                     patch_key.nz = static_cast<int>(std::llround(plane_normal.z * quant));
                     patch_key.d = static_cast<int>(std::llround(plane_d * quant));
 
-                    WallPatchAccum& accum = wall_patch_accums[patch_key];
-                    accum.area_sum += area;
-                    accum.weighted_contact_sum += contact_point * area;
-                    accum.normal_sum += contact_normal * area;
-                    accum.penetration_max = std::max(accum.penetration_max, penetration);
+                    WallContactCandidate candidate;
+                    candidate.plane_key = patch_key;
+                    candidate.area = area;
+                    candidate.penetration = penetration;
+                    candidate.contact_point = contact_point;
+                    candidate.contact_normal = contact_normal;
+                    candidate.polygon = contact_polygon;
+                    wall_candidates.push_back(candidate);
+                }
+
+                UnionFind wall_contact_uf(static_cast<int>(wall_candidates.size()));
+                double merge_tol = std::max(tol * 10.0, 1e-9);
+                for (int a = 0; a < static_cast<int>(wall_candidates.size()); ++a) {
+                    for (int b = a + 1; b < static_cast<int>(wall_candidates.size()); ++b) {
+                        if (wall_candidates[a].plane_key == wall_candidates[b].plane_key &&
+                            polygons_connected(wall_candidates[a].polygon, wall_candidates[b].polygon, merge_tol)) {
+                            wall_contact_uf.unite(a, b);
+                        }
+                    }
+                }
+
+                std::unordered_map<int, WallPatchAccum> wall_patch_accums;
+                std::unordered_map<int, WallPatchKey> wall_patch_keys;
+                for (int idx = 0; idx < static_cast<int>(wall_candidates.size()); ++idx) {
+                    int root = wall_contact_uf.find(idx);
+                    const WallContactCandidate& candidate = wall_candidates[idx];
+                    WallPatchAccum& accum = wall_patch_accums[root];
+                    accum.area_sum += candidate.area;
+                    accum.weighted_contact_sum += candidate.contact_point * candidate.area;
+                    accum.normal_sum += candidate.contact_normal * candidate.area;
+                    accum.penetration_max = std::max(accum.penetration_max, candidate.penetration);
                     accum.tri_count += 1;
+                    wall_patch_keys[root] = candidate.plane_key;
                 }
 
                 for (const auto& entry : wall_patch_accums) {
-                    const WallPatchKey& patch_key = entry.first;
+                    const WallPatchKey& patch_key = wall_patch_keys[entry.first];
                     const WallPatchAccum& accum = entry.second;
                     if (accum.area_sum <= 1e-18) {
                         continue;
@@ -2045,9 +2155,17 @@ int main(int argc, char** argv) {
                     Vec3 fn_vec = contact_normal * fn;
 
                     Vec3 vt = vrel - contact_normal * vn;
-                    long long wall_pair_key = (static_cast<long long>(patch_key.particle_idx) << 32)
-                                            ^ (static_cast<long long>(patch_key.wall_idx & 0xffff) << 16)
-                                            ^ static_cast<unsigned int>((patch_key.d ^ patch_key.nz ^ patch_key.ny ^ patch_key.nx) & 0xffff);
+                    const double history_quant = 1e4;
+                    WallHistoryKey wall_pair_key;
+                    wall_pair_key.particle_idx = patch_key.particle_idx;
+                    wall_pair_key.wall_idx = patch_key.wall_idx;
+                    wall_pair_key.nx = patch_key.nx;
+                    wall_pair_key.ny = patch_key.ny;
+                    wall_pair_key.nz = patch_key.nz;
+                    wall_pair_key.d = patch_key.d;
+                    wall_pair_key.cx = static_cast<int>(std::llround(contact_point.x * history_quant));
+                    wall_pair_key.cy = static_cast<int>(std::llround(contact_point.y * history_quant));
+                    wall_pair_key.cz = static_cast<int>(std::llround(contact_point.z * history_quant));
                     Vec3 ds = wall_tangential_disp[wall_pair_key];
                     ds += vt * cfg.dt;
                     ds -= contact_normal * dot(ds, contact_normal);
