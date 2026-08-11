@@ -1213,6 +1213,7 @@ struct SimConfig {
     bool split_contacts = true;
     bool center_mesh = true;
     bool contact_debug = false;
+    double tangential_damping = 1.0;  // 切向阻尼系数: ct = tangential_damping * sqrt(kt*m_eff)
     std::string stl_path;
     std::string vtk_prefix = "particles";
     int output_interval = 1;
@@ -1366,6 +1367,8 @@ static bool parse_config_file(const std::string& path, SimConfig& cfg) {
             iss >> cfg.v0.x >> cfg.v0.y >> cfg.v0.z;
         } else if (key == "v1") {
             iss >> cfg.v1.x >> cfg.v1.y >> cfg.v1.z;
+        } else if (key == "tangential_damping") {
+            iss >> cfg.tangential_damping;
         }
     }
     if (in_particle) {
@@ -1937,7 +1940,7 @@ int main(int argc, char** argv) {
                         e = std::min(0.9999, std::max(1e-6, e));
                         double loge = std::log(e);
                         double cn = 2.0 * loge * std::sqrt(kn * m_eff) / std::sqrt(loge * loge + 3.141592653589793 * 3.141592653589793);
-                        double ct = 2.0 * loge * std::sqrt(kt * m_eff) / std::sqrt(loge * loge + 3.141592653589793 * 3.141592653589793);
+                        double ct = cfg.tangential_damping * std::sqrt(kt * m_eff);
                         cn = std::abs(cn);
                         ct = std::abs(ct);
 
@@ -2106,7 +2109,7 @@ int main(int argc, char** argv) {
                     e = std::min(0.9999, std::max(1e-6, e));
                     double loge = std::log(e);
                     double cn = 2.0 * loge * std::sqrt(kn * m_eff) / std::sqrt(loge * loge + 3.141592653589793 * 3.141592653589793);
-                    double ct = 2.0 * loge * std::sqrt(kt * m_eff) / std::sqrt(loge * loge + 3.141592653589793 * 3.141592653589793);
+                    double ct = cfg.tangential_damping * std::sqrt(kt * m_eff);
                     cn = std::abs(cn);
                     ct = std::abs(ct);
 

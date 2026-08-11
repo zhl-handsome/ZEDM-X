@@ -57,3 +57,7 @@ Thumbs.db
 # Project specific
 examples/output/
 tests/output/
+
+# Local test cases & agent docs (not tracked)
+scratch/
+CLAUDE.md
