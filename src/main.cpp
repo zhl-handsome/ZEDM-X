@@ -2089,7 +2089,23 @@ int main(int argc, char** argv) {
                     if (norm2(contact_normal) < 1e-20) {
                         continue;
                     }
-                    Vec3 contact_point = accum.weighted_contact_sum / accum.area_sum;
+                    // Continuous contact point: penetration-depth-weighted average of the
+                    // particle's penetrating vertices. Replaces the clipped-polygon centroid
+                    // (weighted_contact_sum/area_sum) which jumps discretely whenever a facet
+                    // enters/leaves the overlap, injecting energy via the torque arm rP. Each
+                    // vertex world position quat_rotate(rot,v)+pos is continuous in the motion,
+                    // and max(0,-s) is continuous, so this point is Lipschitz-continuous.
+                    Vec3 wp_n = wall_candidates.front().contact_normal;
+                    Vec3 wp_p0 = wall_candidates.front().contact_point;
+                    Vec3 cp_acc{0.0, 0.0, 0.0}; double cp_wsum = 0.0;
+                    for (const auto& v : pmesh.vertices) {
+                        Vec3 wv = quat_rotate(p.tf.rot, v) + p.tf.pos;
+                        double s = dot(wp_n, wv - wp_p0);
+                        double delta = std::max(0.0, -s);
+                        if (delta > 1e-12) { cp_acc = cp_acc + wv * delta; cp_wsum += delta; }
+                    }
+                    Vec3 contact_point = (cp_wsum > 1e-18) ? (cp_acc / cp_wsum)
+                                                           : (accum.weighted_contact_sum / accum.area_sum);
 
                     Vec3 rP = contact_point - p.tf.pos;
                     Vec3 vP = p.vel + cross(p.omega, rP);
@@ -2101,21 +2117,33 @@ int main(int argc, char** argv) {
                     double nu_p = p.poisson;
                     double A_n = accum.area_sum;
 
-                    double kn = (Ep / Rp) * A_n;
-                    double kt = (Ep / (2.0 * (1.0 + nu_p) * Rp)) * A_n;
+                    // Tangential stiffness: fixed material value (An-independent) so the
+                    // Cundall spring force -kt*ds does not step when facets enter/leave overlap.
+                    double kt = (Ep * Rp) / (2.0 * (1.0 + nu_p));
+
+                    // Hertz contact model: drive the normal force by the continuous penetration
+                    // depth (deepest vertex -> wall), NOT by the clipped contact area A_n.
+                    // A_n is a step function of the particle pose; Fn ∝ An^(4/3) injects energy
+                    // every time a facet enters/leaves the overlap (energy analysis showed total
+                    // energy rising 0.83->1.90 under higher mu, i.e. the step-driven force feeds a
+                    // rotation->An-jump->injection positive feedback). penetration_max is Lipschitz-
+                    // continuous in the motion, so Fn = k_h * pen^(3/2) is smooth and the elastic
+                    // potential U = (2/5) k_h pen^(5/2) is conserved exactly (dU/dt = Fn*vn).
+                    double pen = std::max(accum.penetration_max, 0.0);
+                    double Estar = Ep / (2.0 * (1.0 - nu_p * nu_p));
+                    double k_h = (4.0 / 3.0) * Estar * std::sqrt(Rp);            // Hertz coefficient (material+geom, const)
+                    double kn_eff = 1.5 * k_h * std::sqrt(std::max(pen, 1e-12)); // tangent stiffness (continuous in pen)
 
                     double m_eff = p.mass;
                     double e = p.restitution;
                     e = std::min(0.9999, std::max(1e-6, e));
                     double loge = std::log(e);
-                    double cn = 2.0 * loge * std::sqrt(kn * m_eff) / std::sqrt(loge * loge + 3.141592653589793 * 3.141592653589793);
+                    double cn = 2.0 * loge * std::sqrt(kn_eff * m_eff) / std::sqrt(loge * loge + 3.141592653589793 * 3.141592653589793);
                     double ct = cfg.tangential_damping * std::sqrt(kt * m_eff);
                     cn = std::abs(cn);
                     ct = std::abs(ct);
 
-                    // Use the clipped contact area and deepest plane penetration to approximate overlap volume.
-                    double deltaV = A_n * std::max(accum.penetration_max, 0.0);
-                    double fn_elastic = (deltaV > 0.0) ? (kn * std::cbrt(deltaV)) : 0.0;
+                    double fn_elastic = (pen > 0.0) ? (k_h * pen * std::sqrt(pen)) : 0.0;
                     double fn_damping = (vn < 0.0) ? (-cn * vn) : 0.0;
                     double fn = fn_elastic + fn_damping;
                     if (fn < 0.0) fn = 0.0;
