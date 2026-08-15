@@ -2149,7 +2149,7 @@ int main(int argc, char** argv) {
                     if (fn < 0.0) fn = 0.0;
                     Vec3 fn_vec = contact_normal * fn;
 
-                    Vec3 vt = vrel - contact_normal * vn;
+                    // Wall history key (kept for tangential-disp map cleanup).
                     const double history_quant = 1e4;
                     WallHistoryKey wall_pair_key;
                     wall_pair_key.particle_idx = patch_key.particle_idx;
@@ -2161,25 +2161,46 @@ int main(int argc, char** argv) {
                     wall_pair_key.cx = static_cast<int>(std::llround(contact_point.x * history_quant));
                     wall_pair_key.cy = static_cast<int>(std::llround(contact_point.y * history_quant));
                     wall_pair_key.cz = static_cast<int>(std::llround(contact_point.z * history_quant));
-                    Vec3 ds = wall_tangential_disp[wall_pair_key];
-                    ds += vt * cfg.dt;
-                    ds -= contact_normal * dot(ds, contact_normal);
-                    Vec3 ft = ds * (-kt) + vt * (-ct);
 
+                    // Distributed tangential friction over the penetrating-vertex contact
+                    // region. A single contact point cannot dissipate spin about the contact
+                    // normal (yaw): for omega = (0,0,w) and r = (0,0,-h), the point velocity
+                    // v_t = omega x r = 0, so point friction does no work and yaw never
+                    // decays (observed: wz frozen at 0.34 rad/s while wx,wy decay to ~0).
+                    // A real contact patch spans multiple vertices whose individual
+                    // velocities omega x r_v differ; summing their friction torques
+                    // -ct * sum(r_v x v_t_v) damps the spin while the net force cancels.
+                    // Weights are penetration depths (sum = cp_wsum), Coulomb-clamped per
+                    // vertex against that vertex's share of the normal force.
+                    Vec3 ft_total{0.0, 0.0, 0.0};
+                    Vec3 torque_ft{0.0, 0.0, 0.0};
                     double mu = std::min(p.mu, wall.mu);
-                    double ft_norm = norm(ft);
-                    double ft_max = mu * fn;
-                    if (ft_norm > ft_max && ft_norm > 1e-14) {
-                        ft = ft * (ft_max / ft_norm);
-                        if (kt > 1e-12) {
-                            ds = ft * (-1.0 / kt);
+                    for (const auto& v : pmesh.vertices) {
+                        Vec3 wv = quat_rotate(p.tf.rot, v) + p.tf.pos;
+                        double s = dot(wp_n, wv - wp_p0);
+                        double delta = std::max(0.0, -s);
+                        if (delta <= 1e-12) continue;
+                        double w_v = delta / cp_wsum;
+                        Vec3 r_v = wv - p.tf.pos;
+                        Vec3 v_v = p.vel + cross(p.omega, r_v);
+                        double vn_v = dot(v_v, contact_normal);
+                        Vec3 vt_v = v_v - contact_normal * vn_v;
+                        Vec3 ft_v = vt_v * (-ct * w_v);
+                        double ftv_norm = norm(ft_v);
+                        double ftv_max = mu * fn * w_v;
+                        if (ftv_norm > ftv_max && ftv_norm > 1e-14) {
+                            ft_v = ft_v * (ftv_max / ftv_norm);
                         }
+                        ft_total = ft_total + ft_v;
+                        torque_ft = torque_ft + cross(r_v, ft_v);
                     }
-                    wall_tangential_disp[wall_pair_key] = ds;
 
-                    Vec3 f = fn_vec + ft;
+                    // Normal force acts at the (continuous) weighted contact point;
+                    // tangential torques are already accumulated per vertex, so only the
+                    // normal share of the contact-point torque is taken here.
+                    Vec3 f = fn_vec + ft_total;
                     forces[i] += f;
-                    torques[i] += cross(rP, f);
+                    torques[i] += cross(rP, fn_vec) + torque_ft;
 
                     active_wall_pairs.insert(wall_pair_key);
                     contact_counts[i] += 1;
