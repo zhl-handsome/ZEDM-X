@@ -13,22 +13,27 @@
 // (phase 2 recomputes the identical deterministic test of phase 1, and every
 // crossing vertex accumulates force, fn is only clamped to 0 never removed).
 //
-// Sign contract (differs from CPU only in generality): the CPU re-orients the
-// group normal toward the particle every step, so its s = dot(n,wv)+d is
-// always <= 0 for a crossing vertex (n points at the particle). Device wall
-// groups were oriented toward the FIRST particle once, at upload (Task 3).
-// This kernel derives the particle's side from its center of mass,
-// side = sign(dot(n,pos)+d), and works the CPU's rule in that side's frame:
-// a vertex penetrates iff s*side <= -1e-12 (beyond the plane, seen from the
-// particle side), depth d_v = -s*side, push direction n_eff = n*side. That is
-// algebraically the CPU's per-particle orientation for a particle on EITHER
-// side of the plane, and numerically identical for the single-side scenarios
-// of every test config (particle stays on the upload side: side=+1, the
-// crossing test is the CPU's `s > -1e-12 -> skip` verbatim). A plain |s| rule
-// would misfire: any vertex on the particle's own side whose projection lands
-// in a footprint would count as penetrating at arbitrary distance. The
-// footprint test uses the stored group normal; its outcome depends only on
-// the winding consistency between footprint and that normal, not on side.
+// Sign contract: the CPU re-orients the group normal toward the particle every
+// step, so s = dot(n,wv)+d is always <= 0 for a crossing vertex (n points at
+// the particle). Device wall groups were oriented toward the FIRST particle
+// once, at upload (Task 3), so n is fixed for the run. This kernel derives the
+// particle's side from its center of mass, side = sign(dot(n,pos)+d), and
+// works the CPU's rule in that side's frame: a vertex penetrates iff
+// s*side <= -1e-12 (beyond the plane, seen from the particle side), depth
+// d_v = -s*side, push n_eff = n*side.
+//
+// Equivalence to the CPU holds only for particles on the upload-time side
+// (all current test scenarios: floor + particles above, side = +1, the
+// crossing test is the CPU's `s > -1e-12 -> skip` verbatim). From the far side
+// the CPU feeds its side-flipped normal into point_in_tri, so its footprint
+// gate is effectively single-sided (blind from the wound back side), while the
+// device footprint gate always uses the stored group normal and responds from
+// both sides. Known divergence: revisit before any mixed-side scenario. A
+// plain |s| rule would still misfire (any vertex on the particle's own side
+// whose projection lands in a footprint would count as penetrating at
+// arbitrary distance); the footprint test uses the stored group normal, so its
+// outcome depends only on the winding consistency between footprint and that
+// normal, not on side.
 //
 // Broad phase: the CPU skips a (particle, wall) pair when bounding spheres
 // miss and drops wall triangles whose AABB misses the particle box. The
