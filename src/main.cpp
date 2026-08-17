@@ -1186,22 +1186,42 @@ static Mat3 inertia_world_inv(const Particle& p) {
     return mat3_mul(mat3_mul(R, p.inertia_body_inv), Rt);
 }
 
+// Exact exponential rotation increment for a world-frame angular velocity:
+// dq = {cos(th/2), w_hat*sin(th/2)}, q' = dq (x) q. Unlike the linearized
+// q += 0.5*qdot*dt this preserves the quaternion norm exactly per step.
+static Quat quat_step_world(const Quat& q, const Vec3& w, double dt) {
+    double wmag = std::sqrt(w.x * w.x + w.y * w.y + w.z * w.z);
+    double th = wmag * dt;
+    Quat dq;
+    if (th < 1e-300) {
+        dq.w = 1.0; dq.x = 0.0; dq.y = 0.0; dq.z = 0.0;
+    } else {
+        double s = std::sin(0.5 * th) / wmag;
+        dq.w = std::cos(0.5 * th);
+        dq.x = w.x * s; dq.y = w.y * s; dq.z = w.z * s;
+    }
+    return quat_mul(dq, q);
+}
+
 static void integrate_particle(Particle& p, const Vec3& force, const Vec3& torque, const Vec3& gravity, double dt) {
     Vec3 acc = force * p.inv_mass + gravity;
     p.vel += acc * dt;
     p.tf.pos += p.vel * dt;
 
-    Mat3 Iinv = inertia_world_inv(p);
     p.L += torque * dt;
-    p.omega = mat3_mul_vec3(Iinv, p.L);
 
-    Quat dq{0.0, p.omega.x, p.omega.y, p.omega.z};
-    Quat qdot = quat_mul(dq, p.tf.rot);
-    p.tf.rot.w += 0.5 * qdot.w * dt;
-    p.tf.rot.x += 0.5 * qdot.x * dt;
-    p.tf.rot.y += 0.5 * qdot.y * dt;
-    p.tf.rot.z += 0.5 * qdot.z * dt;
-    p.tf.rot = quat_normalize(p.tf.rot);
+    // Midpoint attitude integration with exact exponential rotation steps.
+    // The old explicit form (omega from the PRE-rotation inertia, quaternion
+    // advanced linearly) injects rotational energy for an asymmetric body:
+    // a torque-free spinner at 400 rad/s grew to 2875 rad/s (isolated test).
+    // Here the half-step attitude is used to re-evaluate omega before the
+    // full step, and each rotation increment is a norm-preserving exponential.
+    Quat q0 = p.tf.rot;
+    Vec3 w0 = mat3_mul_vec3(inertia_world_inv(p), p.L);
+    p.tf.rot = quat_step_world(q0, w0, 0.5 * dt);
+    Vec3 wh = mat3_mul_vec3(inertia_world_inv(p), p.L);
+    p.tf.rot = quat_step_world(q0, wh, dt);
+    p.omega = mat3_mul_vec3(inertia_world_inv(p), p.L);
 }
 
 struct SimConfig {
@@ -1725,6 +1745,10 @@ int main(int argc, char** argv) {
     std::vector<Vec3> torques(particles.size());
     std::vector<int> contact_counts(particles.size());
     std::unordered_map<long long, Vec3> tangential_disp;
+    // Per-pair persistent contact state: kinematic normal penetration and the
+    // locked interface normal (see particle-particle contact for rationale).
+    std::unordered_map<long long, double> pair_normal_pen;
+    std::unordered_map<long long, Vec3> pair_locked_normal;
 
     std::filesystem::create_directories(cfg.output_dir);
 
@@ -1843,6 +1867,51 @@ int main(int argc, char** argv) {
                 t_tri += std::chrono::steady_clock::now() - t0;
 
                 if (segments.empty()) {
+                    // Residual contact: the intersection loop can vanish while the meshes
+                    // are still deeply overlapped (one surface fully swallowing the other),
+                    // which used to leave a zero-force gap the particles tunneled through.
+                    // Keep pushing apart with the locked normal and the kinematic
+                    // penetration state until it drains to zero.
+                    auto pen_it = pair_normal_pen.find(pair_key);
+                    if (pen_it != pair_normal_pen.end() && pen_it->second > 1e-9) {
+                        auto n_it = pair_locked_normal.find(pair_key);
+                        if (n_it != pair_locked_normal.end()) {
+                            Vec3 nL = n_it->second;
+                            Vec3 xc_mid = (pa.tf.pos + pb.tf.pos) * 0.5;
+                            Vec3 rAm = xc_mid - pa.tf.pos;
+                            Vec3 rBm = xc_mid - pb.tf.pos;
+                            Vec3 vAm = pa.vel + cross(pa.omega, rAm);
+                            Vec3 vBm = pb.vel + cross(pb.omega, rBm);
+                            double vnm = dot(vBm - vAm, nL);
+                            double& pen_s = pen_it->second;
+                            pen_s -= vnm * cfg.dt;
+                            double Rp1 = std::max(pa.equiv_radius, 1e-12);
+                            double Rp2 = std::max(pb.equiv_radius, 1e-12);
+                            pen_s = std::min(std::max(pen_s, 0.0), 0.3 * std::min(Rp1, Rp2));
+                            double E1r = std::max(pa.young, 1e-12);
+                            double E2r = std::max(pb.young, 1e-12);
+                            double nu1r = pa.poisson, nu2r = pb.poisson;
+                            double Estar_r = 1.0 / ((1.0 - nu1r * nu1r) / E1r + (1.0 - nu2r * nu2r) / E2r);
+                            double Rstar_r = (Rp1 * Rp2) / std::max(Rp1 + Rp2, 1e-12);
+                            double k_hr = (4.0 / 3.0) * Estar_r * std::sqrt(Rstar_r);
+                            double kn_eff_r = 1.5 * k_hr * std::sqrt(std::max(pen_s, 1e-12));
+                            double m_eff_r = 1.0 / (pa.inv_mass + pb.inv_mass);
+                            double e_r = std::min(pa.restitution, pb.restitution);
+                            e_r = std::min(0.9999, std::max(1e-6, e_r));
+                            double loge_r = std::log(e_r);
+                            double cn_r = std::abs(2.0 * loge_r * std::sqrt(kn_eff_r * m_eff_r) /
+                                std::sqrt(loge_r * loge_r + 3.141592653589793 * 3.141592653589793));
+                            double fnr = k_hr * pen_s * std::sqrt(pen_s);
+                            if (vnm < 0.0) fnr += -cn_r * vnm;
+                            if (fnr < 0.0) fnr = 0.0;
+                            Vec3 fnv = nL * fnr;
+                            forces[i] -= fnv;
+                            forces[j] += fnv;
+                            torques[i] += cross(rAm, fnv * -1.0);
+                            torques[j] += cross(rBm, fnv);
+                            active_pairs.insert(pair_key);
+                        }
+                    }
                     continue;
                 }
 
@@ -1914,8 +1983,40 @@ int main(int argc, char** argv) {
                             // }
                             nA = nA * -1.0;
                         }
-                        Vec3 rA = xc0 - pa.tf.pos;
-                        Vec3 rB = xc0 - pb.tf.pos;
+                        // Lock the contact normal for the lifetime of this persistent pair:
+                        // the loop-derived nA flips up to 90 degrees when the intersection
+                        // loop re-forms on different faces mid-impact, injecting energy.
+                        // Collisions are short, so the first-detection normal is kept.
+                        if (pair_locked_normal.find(pair_key) == pair_locked_normal.end()) {
+                            pair_locked_normal.emplace(pair_key, nA);
+                            pair_normal_pen.emplace(pair_key, 0.0);
+                        }
+                        nA = pair_locked_normal[pair_key];
+                        // Continuous contact point: penetration-depth-weighted average of
+                        // vertices crossing the interface. Weights max(0, s) vanish smoothly
+                        // at the patch edge, so the point stays continuous as facets enter/
+                        // leave -- unlike the loop-derived xc0, which steps discretely and
+                        // injects energy through the torque arm and the omega x r velocity.
+                        // EVERYTHING downstream (arms, velocities, penetration) uses it.
+                        Vec3 xc_num{0.0, 0.0, 0.0}; double xc_den = 0.0;
+                        {
+                            double rc2 = 4.0 * area;
+                            for (const auto& v : meshA.vertices) {
+                                Vec3 wv = quat_rotate(pa.tf.rot, v) + pa.tf.pos;
+                                if (norm2(wv - xc0) > rc2) continue;
+                                double w = std::max(0.0, dot(nA, wv - xc0));
+                                if (w > 1e-12) { xc_num = xc_num + wv * w; xc_den += w; }
+                            }
+                            for (const auto& v : meshB.vertices) {
+                                Vec3 wv = quat_rotate(pb.tf.rot, v) + pb.tf.pos;
+                                if (norm2(wv - xc0) > rc2) continue;
+                                double w = std::max(0.0, -dot(nA, wv - xc0));
+                                if (w > 1e-12) { xc_num = xc_num + wv * w; xc_den += w; }
+                            }
+                        }
+                        Vec3 xc_cont = (xc_den > 1e-18) ? (xc_num / xc_den) : xc0;
+                        Vec3 rA = xc_cont - pa.tf.pos;
+                        Vec3 rB = xc_cont - pb.tf.pos;
                         Vec3 vA = pa.vel + cross(pa.omega, rA);
                         Vec3 vB = pb.vel + cross(pb.omega, rB);
                         Vec3 vrel = vB - vA;
@@ -1929,56 +2030,109 @@ int main(int argc, char** argv) {
                         double nu2 = pb.poisson;
                         double A_n = area;
 
-                        // Normal stiffness (Feng 2021 energy-conserving model)
-                        // kn = (E1/R1 + E2/R2) * An
-                        double kn = (E1 / R1 + E2 / R2) * A_n;
-                        // Tangential stiffness
-                        // kt = (E1/(2*(1+nu1)*R1) + E2/(2*(1+nu2)*R2)) * An
-                        double kt = (E1 / (2.0 * (1.0 + nu1) * R1) + E2 / (2.0 * (1.0 + nu2) * R2)) * A_n;
+                        // Continuous Hertz contact (mirrors the wall-contact fix).
+                        // The loop-derived area A_n is a step function of relative pose:
+                        // Fn proportional to An^1.5 jumps as facets enter/leave the overlap
+                        // and injected ~58 kJ into a 0.1 J collision (two-particle impact
+                        // test), and the normal damping was additionally commented out.
+                        // Drive the force by the deepest vertex penetration instead
+                        // (Lipschitz-continuous in the motion; convex approximation for
+                        // concave regions, acceptable as a force law).
+                        // Kinematic (Cundall-style) penetration: integrate the relative
+                        // normal displacement instead of measuring the overlap geometry.
+                        // The interface-plane thickness intermittently read zero while the
+                        // meshes were clearly overlapped (force gaps of ~1200 steps), then
+                        // snapped back with the flipped normal -- both inject energy. The
+                        // integrated penetration is continuous by construction and starts
+                        // from zero at first detection.
+                        {
+                            double& pen_s = pair_normal_pen[pair_key];
+                            pen_s -= vn * cfg.dt;
+                            pen_s = std::min(std::max(pen_s, 0.0), 0.3 * std::min(R1, R2));
+                        }
+                        double pen = pair_normal_pen[pair_key];
+                        double Estar = 1.0 / ((1.0 - nu1 * nu1) / E1 + (1.0 - nu2 * nu2) / E2);
+                        double Rstar = (R1 * R2) / std::max(R1 + R2, 1e-12);
+                        double k_h = (4.0 / 3.0) * Estar * std::sqrt(Rstar);
+                        double kn_eff = 1.5 * k_h * std::sqrt(std::max(pen, 1e-12));
+                        // Tangential stiffness: fixed material value (An-independent, continuous)
+                        double kt = 0.5 * ((E1 * R1) / (2.0 * (1.0 + nu1)) + (E2 * R2) / (2.0 * (1.0 + nu2)));
                         double m_eff = 1.0 / (pa.inv_mass + pb.inv_mass);
                         double e = std::min(pa.restitution, pb.restitution);
                         e = std::min(0.9999, std::max(1e-6, e));
                         double loge = std::log(e);
-                        double cn = 2.0 * loge * std::sqrt(kn * m_eff) / std::sqrt(loge * loge + 3.141592653589793 * 3.141592653589793);
+                        double cn = 2.0 * loge * std::sqrt(kn_eff * m_eff) / std::sqrt(loge * loge + 3.141592653589793 * 3.141592653589793);
                         double ct = cfg.tangential_damping * std::sqrt(kt * m_eff);
                         cn = std::abs(cn);
                         ct = std::abs(ct);
 
-                        // Estimate overlap volume from contact loop geometry
-                        // Characteristic length from contact area: Lc = sqrt(Area)
-                        // Overlap volume estimate: deltaV ≈ Area^(3/2) (assuming quasi-circular contact)
-                        double deltaV = std::pow(A_n, 1.5);
-
-                        // Normal force: Fn = kn * deltaV^(1/3)
-                        // deltaV^(1/3) ≈ Area^(1/2) acts as equivalent penetration depth
-                        double fn = kn * std::cbrt(deltaV);
-                         /*if (vn < 0.0) {
-                            fn += -cn * vn;
-                        }*/
+                        // Hertz normal force + Tsuji damping (re-enabled; was commented out)
+                        double fn_elastic = (pen > 0.0) ? (k_h * pen * std::sqrt(pen)) : 0.0;
+                        double fn_damping = (vn < 0.0) ? (-cn * vn) : 0.0;
+                        double fn = fn_elastic + fn_damping;
                         if (fn < 0.0) fn = 0.0;
                         Vec3 fn_vec = nA * fn;
 
-                        Vec3 vt = vrel - nA * vn;
-                        Vec3 ds = tangential_disp[pair_key];
-                        ds += vt * cfg.dt;
-                        ds -= nA * dot(ds, nA);
-                        Vec3 ft = ds * (-kt) + vt * (-ct);
+                        // Distributed tangential friction over the contact-patch vertices
+                        // (both sides). A single contact point cannot dissipate spin about
+                        // the contact normal (v_t = omega x r = 0 on the axis) -- proven by
+                        // the wall-contact yaw fix; persistent particle-particle contacts
+                        // (piles) need the same distributed treatment. Each patch vertex
+                        // carries weight = its penetration depth across the interface
+                        // (continuous, vanishes at the patch edge).
+                        Vec3 ft_total{0.0, 0.0, 0.0};
+                        Vec3 torque_ftA{0.0, 0.0, 0.0};
+                        Vec3 torque_ftB{0.0, 0.0, 0.0};
                         double mu = std::min(pa.mu, pb.mu);
-                        double ft_norm = norm(ft);
-                        double ft_max = mu * fn;
-                        if (ft_norm > ft_max && ft_norm > 1e-14) {
-                            ft = ft * (ft_max / ft_norm);
-                            if (kt > 1e-12) {
-                                ds = ft * (-1.0 / kt);
+                        {
+                            double rc2 = 4.0 * A_n;
+                            Vec3 pv[160]; double pw[160]; int pcount = 0;
+                            double wsum = 0.0;
+                            for (const auto& v : meshA.vertices) {
+                                if (pcount >= 160) break;
+                                Vec3 wv = quat_rotate(pa.tf.rot, v) + pa.tf.pos;
+                                if (norm2(wv - xc_cont) > rc2) continue;
+                                double w = std::max(0.0, dot(nA, wv - xc_cont));
+                                if (w <= 1e-12) continue;
+                                pv[pcount] = wv; pw[pcount] = w; wsum += w; ++pcount;
+                            }
+                            for (const auto& v : meshB.vertices) {
+                                if (pcount >= 160) break;
+                                Vec3 wv = quat_rotate(pb.tf.rot, v) + pb.tf.pos;
+                                if (norm2(wv - xc_cont) > rc2) continue;
+                                double w = std::max(0.0, -dot(nA, wv - xc_cont));
+                                if (w <= 1e-12) continue;
+                                pv[pcount] = wv; pw[pcount] = w; wsum += w; ++pcount;
+                            }
+                            if (wsum > 1e-18) {
+                                for (int k = 0; k < pcount; ++k) {
+                                    double w_v = pw[k] / wsum;
+                                    Vec3 wv = pv[k];
+                                    Vec3 vA_s = pa.vel + cross(pa.omega, wv - pa.tf.pos);
+                                    Vec3 vB_s = pb.vel + cross(pb.omega, wv - pb.tf.pos);
+                                    Vec3 vrel_v = vB_s - vA_s;
+                                    double vn_v = dot(vrel_v, nA);
+                                    Vec3 vt_v = vrel_v - nA * vn_v;
+                                    Vec3 ft_v = vt_v * (-ct * w_v);
+                                    double ftv_norm = norm(ft_v);
+                                    double ftv_max = mu * fn * w_v;
+                                    if (ftv_norm > ftv_max && ftv_norm > 1e-14) {
+                                        ft_v = ft_v * (ftv_max / ftv_norm);
+                                    }
+                                    ft_total = ft_total + ft_v;
+                                    torque_ftA = torque_ftA + cross(wv - pa.tf.pos, ft_v * -1.0);
+                                    torque_ftB = torque_ftB + cross(wv - pb.tf.pos, ft_v);
+                                }
                             }
                         }
-                        tangential_disp[pair_key] = ds;
 
-                        Vec3 f = fn_vec + ft;
+                        // Normal force acts at the continuous contact point; tangential
+                        // torques are already accumulated per vertex.
+                        Vec3 f = fn_vec + ft_total;
                         forces[i] -= f;
                         forces[j] += f;
-                        torques[i] += cross(rA, f * -1.0);
-                        torques[j] += cross(rB, f);
+                        torques[i] += cross(rA, fn_vec * -1.0) + torque_ftA;
+                        torques[j] += cross(rB, fn_vec) + torque_ftB;
                         active_pairs.insert(pair_key);
                         contact_counts[i] += 1;
                         contact_counts[j] += 1;
@@ -2231,6 +2385,20 @@ int main(int argc, char** argv) {
             } else {
                 ++it;
             }
+        }
+        // Keep the kinematic penetration across short detection gaps (the
+        // intersection loop can intermittently vanish while the meshes are
+        // still overlapping); decay it slowly so stale state dies out.
+        for (auto it = pair_normal_pen.begin(); it != pair_normal_pen.end(); ) {
+            if (active_pairs.find(it->first) == active_pairs.end()) {
+                it->second *= 0.995;
+                if (it->second < 1e-9) {
+                    pair_locked_normal.erase(it->first);
+                    it = pair_normal_pen.erase(it);
+                    continue;
+                }
+            }
+            ++it;
         }
 
         // Clean up inactive wall contact tangential displacements
