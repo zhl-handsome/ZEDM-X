@@ -33,9 +33,14 @@ target_link_libraries(zdem_cpu PRIVATE zdem_core)
 
 add_executable(zdem_gpu
     src/gpu/dem_gpu.cu
+    src/gpu/dem_state.cu
 )
 target_link_libraries(zdem_gpu PRIVATE zdem_core)
 target_compile_definitions(zdem_gpu PRIVATE ${ZDEM_DEFINE})
+# Static cudart links the static CRT (LIBCMT) while MSVC host code uses /MD,
+# which triggers LNK4098 and mixes two CRTs in one process. Keep one CRT:
+# shared cudart matches the /MD default of zdem_core host code.
+set_property(TARGET zdem_gpu PROPERTY CUDA_RUNTIME_LIBRARY Shared)
 
 add_executable(test_math
     tests/test_math.cpp
