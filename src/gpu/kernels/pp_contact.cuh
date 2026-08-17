@@ -121,27 +121,27 @@ __device__ inline real point_mesh_distance_device(
         real ap[3] = {pt[0] - a[0], pt[1] - a[1], pt[2] - a[2]};
         const real d1 = ab[0]*ap[0] + ab[1]*ap[1] + ab[2]*ap[2];
         const real d2 = ac[0]*ap[0] + ac[1]*ap[1] + ac[2]*ap[2];
-        real q[3];
+        real cpt[3];  // closest point on this triangle (NOT the quaternion q!)
         if (d1 <= real(0) && d2 <= real(0)) {
-            q[0] = a[0]; q[1] = a[1]; q[2] = a[2];                 // vertex A region
+            cpt[0] = a[0]; cpt[1] = a[1]; cpt[2] = a[2];          // vertex A region
         } else {
             real bp[3] = {pt[0] - b[0], pt[1] - b[1], pt[2] - b[2]};
             const real d3 = ab[0]*bp[0] + ab[1]*bp[1] + ab[2]*bp[2];
             const real d4 = ac[0]*bp[0] + ac[1]*bp[1] + ac[2]*bp[2];
             if (d3 >= real(0) && d4 <= d3) {
-                q[0] = b[0]; q[1] = b[1]; q[2] = b[2];             // vertex B region
+                cpt[0] = b[0]; cpt[1] = b[1]; cpt[2] = b[2];      // vertex B region
             } else {
                 real cp[3] = {pt[0] - c[0], pt[1] - c[1], pt[2] - c[2]};
                 const real d5 = ab[0]*cp[0] + ab[1]*cp[1] + ab[2]*cp[2];
                 const real d6 = ac[0]*cp[0] + ac[1]*cp[1] + ac[2]*cp[2];
                 if (d6 >= real(0) && d5 <= d6) {
-                    q[0] = c[0]; q[1] = c[1]; q[2] = c[2];         // vertex C region
+                    cpt[0] = c[0]; cpt[1] = c[1]; cpt[2] = c[2];  // vertex C region
                 } else if (d1*d4 - d3*d2 <= real(0) && d1 >= real(0) && d3 <= real(0)) {
                     const real s = d1 / (d1 - d3);                 // edge AB
-                    q[0] = a[0] + ab[0]*s; q[1] = a[1] + ab[1]*s; q[2] = a[2] + ab[2]*s;
+                    cpt[0] = a[0] + ab[0]*s; cpt[1] = a[1] + ab[1]*s; cpt[2] = a[2] + ab[2]*s;
                 } else if (d5*d2 - d6*d1 <= real(0) && d6 >= real(0) && d5 <= d3) {
                     const real s = (d6 - d5) / (d3 - d5);          // edge AC
-                    q[0] = c[0] + ac[0]*s; q[1] = c[1] + ac[1]*s; q[2] = c[2] + ac[2]*s;
+                    cpt[0] = c[0] + ac[0]*s; cpt[1] = c[1] + ac[1]*s; cpt[2] = c[2] + ac[2]*s;
                 } else {
                     const real va = d3 * d6 - d5 * d4;             // face region
                     const real vb = d5 * d2 - d1 * d6;
@@ -149,17 +149,17 @@ __device__ inline real point_mesh_distance_device(
                     const real denom = real(1) / (va + vb + vc);
                     const real v = vb * denom;
                     const real w = vc * denom;
-                    q[0] = a[0] + ab[0]*v + ac[0]*w;
-                    q[1] = a[1] + ab[1]*v + ac[1]*w;
-                    q[2] = a[2] + ab[2]*v + ac[2]*w;
+                    cpt[0] = a[0] + ab[0]*v + ac[0]*w;
+                    cpt[1] = a[1] + ab[1]*v + ac[1]*w;
+                    cpt[2] = a[2] + ab[2]*v + ac[2]*w;
                 }
             }
         }
-        const real dx = pt[0] - q[0], dy = pt[1] - q[1], dz = pt[2] - q[2];
+        const real dx = pt[0] - cpt[0], dy = pt[1] - cpt[1], dz = pt[2] - cpt[2];
         const real dist2 = dx*dx + dy*dy + dz*dz;
         if (dist2 < best2) {
             best2 = dist2;
-            bq[0] = q[0]; bq[1] = q[1]; bq[2] = q[2];
+            bq[0] = cpt[0]; bq[1] = cpt[1]; bq[2] = cpt[2];
         }
     }
     out_cp[0] = bq[0]; out_cp[1] = bq[1]; out_cp[2] = bq[2];
@@ -234,7 +234,11 @@ __device__ inline void pp_store_hit(
 }
 
 // One block of kPPThreads per candidate pair. blockDim.x MUST be
-// kPPThreads (the shared staging is sized for it).
+// kPPThreads: the shared staging below is sized by kPPThreads while the
+// launch site (dem_gpu.cu) passes its own kThreads -- two constants that
+// only coincide by convention. The guard at the top of the kernel turns a
+// mismatched launch into a no-op instead of out-of-bounds shared writes
+// (s_red is indexed 3*threadIdx.x for every launched thread).
 __global__ void pp_contact_kernel(
     /* particle state (const) */ const real* pos, const real* quat,
     const real* vel, const real* omega, const real* inv_mass,
@@ -246,6 +250,7 @@ __global__ void pp_contact_kernel(
     /* pairs */ const int* d_pairs, int n_pairs,
     /* params */ real tangential_damping,
     /* out */ real* force, real* torque, int* contact_count, int* contacts) {
+    if (blockDim.x != kPPThreads) return;  // shared staging sized kPPThreads
     (void)radius;  // broad phase already applied the bounding-sphere test
     const int p = blockIdx.x;
     if (p >= n_pairs) return;

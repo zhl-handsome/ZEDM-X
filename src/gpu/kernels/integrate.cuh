@@ -61,26 +61,31 @@ __device__ inline void quat_mul_device(const real a[4], const real b[4], real ou
     out[3] = a[0]*b[3] + a[1]*b[2] - a[2]*b[1] + a[3]*b[0];
 }
 
-// Rotate v by q (q = {w,x,y,z}): v + 2*qv x (qv x v + w*v). q is normalized
-// first so config-supplied non-unit quaternions match CPU quat_rotate (which
-// normalizes internally). A degenerate norm == 0 returns v unchanged.
+// Rotate v by q (q = {w,x,y,z}): EXACT port of the CPU sandwich product
+// quat_rotate (src/core/quat.hpp): p = (0, v.x, v.y, v.z),
+// r = quat_mul(quat_mul(qn, p), quat_conj(qn)), result = r's vector part.
+// quat_mul_device below is the component-for-component port of CPU quat_mul
+// (same Hamilton product expression tree), so FP64 output is bit-identical
+// to the CPU. The previous cross-product form v + 2w(qv x v) + 2qv x (qv x v)
+// is algebraically equal but a different expression tree and drifted ~1e-11
+// relative. Normalization matches CPU quat_normalize exactly: n < 1e-14
+// falls back to the unit quaternion {1,0,0,0} (CPU returns Quat{}, the
+// identity rotation), and the sandwich product still runs through the same
+// two quat_mul calls in that degenerate case.
 __device__ inline void quat_rotate_device(const real q[4], const real v[3], real out[3]) {
     real n = r_sqrt(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
-    if (n == real(0)) {
-        out[0] = v[0]; out[1] = v[1]; out[2] = v[2];
-        return;
+    real qn[4];
+    if (n < real(1e-14)) {
+        qn[0] = real(1); qn[1] = real(0); qn[2] = real(0); qn[3] = real(0);
+    } else {
+        qn[0] = q[0] / n; qn[1] = q[1] / n; qn[2] = q[2] / n; qn[3] = q[3] / n;
     }
-    real qw = q[0] / n;
-    real qv[3] = {q[1] / n, q[2] / n, q[3] / n};
-    real c[3] = {qv[1]*v[2] - qv[2]*v[1],
-                 qv[2]*v[0] - qv[0]*v[2],
-                 qv[0]*v[1] - qv[1]*v[0]};
-    real cc[3] = {qv[1]*c[2] - qv[2]*c[1],
-                  qv[2]*c[0] - qv[0]*c[2],
-                  qv[0]*c[1] - qv[1]*c[0]};
-    out[0] = v[0] + real(2)*(qw*c[0] + cc[0]);
-    out[1] = v[1] + real(2)*(qw*c[1] + cc[1]);
-    out[2] = v[2] + real(2)*(qw*c[2] + cc[2]);
+    const real p[4] = {real(0), v[0], v[1], v[2]};
+    real qp[4], r[4];
+    quat_mul_device(qn, p, qp);                           // quat_mul(qn, p)
+    const real qnc[4] = {qn[0], -qn[1], -qn[2], -qn[3]};  // quat_conj(qn)
+    quat_mul_device(qp, qnc, r);
+    out[0] = r[1]; out[1] = r[2]; out[2] = r[3];
 }
 
 // Exact exponential rotation increment for a world-frame angular velocity:
