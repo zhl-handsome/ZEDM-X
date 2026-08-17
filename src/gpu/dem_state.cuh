@@ -44,6 +44,7 @@ struct DeviceParticles {       // SoA state
     int *mesh_index = nullptr;
     real *force = nullptr, *torque = nullptr;  // [3N] zeroed each step
     int *contact_count = nullptr;              // [N]
+    int *contacts = nullptr;                   // [1] per-step contact counter (wall groups now, pp pairs in Task 7)
     int n = 0;
 };
 

@@ -34,6 +34,16 @@ __device__ inline real r_sqrt(real x) {
     else return sqrt(x);
 }
 
+__device__ inline real r_log(real x) {
+    if constexpr (sizeof(real) == 4) return logf(x);
+    else return log(x);
+}
+
+__device__ inline real r_fabs(real x) {
+    if constexpr (sizeof(real) == 4) return fabsf(x);
+    else return fabs(x);
+}
+
 // --------------------------------------------------------------------------
 // quaternion helpers (same conventions as src/core/quat.hpp)
 // --------------------------------------------------------------------------
@@ -145,8 +155,15 @@ __device__ inline void mat3_mul_vec3_device(const real m[9], const real v[3], re
 // kernels
 // --------------------------------------------------------------------------
 // NOTE: no `inline` on the kernels -- nvcc ignores it for __global__ anyway.
-__global__ void clear_forces_kernel(real* force, real* torque, int* cc, int n) {
+// contacts[0] is the per-step contact counter (wall groups here, pp pairs in
+// Task 7): zeroed here, incremented once per contacting block by the contact
+// kernels, read back by the driver for the step log. Thread 0 of block 0
+// zeroes it; the counter is only touched by contact kernels AFTER this
+// kernel completes (stream ordered), so no race.
+__global__ void clear_forces_kernel(real* force, real* torque, int* cc,
+                                    int* contacts, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i == 0) contacts[0] = 0;
     if (i >= n) return;
     for (int k = 0; k < 3; ++k) {
         force[3*i + k] = real(0);

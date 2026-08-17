@@ -386,6 +386,7 @@ void GpuSim::upload(const SimConfig& cfg) {
     P.force = upload_zeroed<real>(3 * static_cast<std::size_t>(n));
     P.torque = upload_zeroed<real>(3 * static_cast<std::size_t>(n));
     P.contact_count = upload_zeroed<int>(static_cast<std::size_t>(n));
+    P.contacts = upload_zeroed<int>(1);  // per-step counter, zeroed by clear_forces_kernel
 
     // Scalar sim parameters (converted to real like everything else).
     dt = static_cast<real>(cfg.dt);
@@ -431,6 +432,8 @@ void GpuSim::free_all() {
     free_buf(P.young); free_buf(P.poisson); free_buf(P.mu); free_buf(P.restitution);
     free_buf(P.mesh_index);
     free_buf(P.force); free_buf(P.torque); free_buf(P.contact_count);
+    free_buf(P.contacts);
+    P.contacts = nullptr;
     P.n = 0;
     free_buf(d_gravity);
     d_gravity = nullptr;

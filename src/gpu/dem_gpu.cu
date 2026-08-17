@@ -15,6 +15,7 @@
 #include "gpu/cuda_check.hpp"
 #include "gpu/dem_state.cuh"
 #include "gpu/kernels/integrate.cuh"
+#include "gpu/kernels/wall_contact.cuh"
 #include "gpu/real.hpp"
 #include "host/config_io.hpp"
 #include "host/vtk_io.hpp"
@@ -34,7 +35,7 @@ void usage() {
 // Per-output-interval snapshot: download the full frame, refresh the host
 // particle registry copy with device state, rotate mesh vertices to world in
 // write_vtk_particles (same CELL_DATA fields and file naming as zdem_cpu).
-void output_vtk(const GpuSim& sim, const SimConfig& cfg, int step, int& contacts_out) {
+void output_vtk(const GpuSim& sim, const SimConfig& cfg, int step) {
     std::vector<double> pos, vel, omega, quat, force, torque;
     std::vector<int> cc;
     sim.download_frame(pos, vel, omega, quat, force, torque, cc);
@@ -56,10 +57,6 @@ void output_vtk(const GpuSim& sim, const SimConfig& cfg, int step, int& contacts
     oss << cfg.vtk_prefix << "_" << std::setw(6) << std::setfill('0') << step << ".vtk";
     std::filesystem::path out_path = std::filesystem::path(cfg.output_dir) / oss.str();
     write_vtk_particles(out_path.string(), sim.host_meshes, parts, forces, torques, cc);
-
-    int contacts = 0;
-    for (int c : cc) contacts += c;
-    contacts_out = contacts;
 }
 
 }  // namespace
@@ -133,9 +130,24 @@ int main(int argc, char** argv) {
         auto step_t0 = std::chrono::steady_clock::now();
         if (n > 0) {
             clear_forces_kernel<<<blocks, kThreads>>>(
-                sim.P.force, sim.P.torque, sim.P.contact_count, n);
+                sim.P.force, sim.P.torque, sim.P.contact_count, sim.P.contacts, n);
             CUDA_CHECK(cudaGetLastError());
-            // (contact kernels arrive in Tasks 5/7)
+            // Wall contact: one block per (particle, wall-group). Same counter
+            // semantics as the CPU step log (wall groups with contact; the
+            // particle-particle kernel joins the same accumulator in Task 7).
+            if (sim.W.n_groups > 0) {
+                dim3 wc_grid(n, sim.W.n_groups);
+                wall_contact_kernel<<<wc_grid, kThreads>>>(
+                    sim.P.pos, sim.P.quat, sim.P.vel, sim.P.omega,
+                    sim.P.mass, sim.P.equiv_radius, sim.P.young,
+                    sim.P.poisson, sim.P.mu, sim.P.restitution,
+                    sim.P.mesh_index, sim.M.d_verts, sim.M.d_voffset,
+                    sim.W.d_gn, sim.W.d_gd, sim.W.d_fp, sim.W.d_fp_start,
+                    sim.W.d_mu, sim.tangential_damping,
+                    sim.P.force, sim.P.torque, sim.P.contact_count, sim.P.contacts,
+                    n, sim.W.n_groups);
+                CUDA_CHECK(cudaGetLastError());
+            }
             integrate_kernel<<<blocks, kThreads>>>(
                 sim.P.pos, sim.P.vel, sim.P.omega, sim.P.quat, sim.P.L,
                 sim.P.force, sim.P.torque, sim.P.inv_mass, sim.P.inertia_body_inv,
@@ -145,7 +157,9 @@ int main(int argc, char** argv) {
         if (step % cfg.output_interval == 0) {
             CUDA_CHECK(cudaDeviceSynchronize());
             int contacts = 0;
-            output_vtk(sim, cfg, step, contacts);
+            CUDA_CHECK(cudaMemcpy(&contacts, sim.P.contacts, sizeof(int),
+                                  cudaMemcpyDeviceToHost));
+            output_vtk(sim, cfg, step);
             double step_ms = std::chrono::duration<double, std::milli>(
                                  std::chrono::steady_clock::now() - step_t0)
                                  .count();
