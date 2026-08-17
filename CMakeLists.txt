@@ -9,6 +9,8 @@ enable_testing()
 add_library(zdem_core
     src/geometry/stl_io.cpp
     src/geometry/mesh_build.cpp
+    src/host/config_io.cpp
+    src/host/vtk_io.cpp
 )
 target_include_directories(zdem_core PUBLIC src)
 
