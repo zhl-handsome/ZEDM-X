@@ -86,6 +86,7 @@ Mat3 inertia_world(const Particle& p) {
 }  // namespace
 
 void GpuSim::upload(const SimConfig& cfg) {
+    free_all();  // idempotent: all pointers null-initialized, frees prior upload
     // ================= host build: same code path as CPU main =================
     std::unordered_map<std::string, std::vector<Triangle>> tri_cache;
     std::unordered_map<std::string, int> mesh_cache;

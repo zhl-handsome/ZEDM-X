@@ -28,7 +28,7 @@ struct DeviceMeshes {          // flattened body-frame mesh registry
 
 struct DeviceWalls {           // static world-space coplanar groups
     real* d_gn = nullptr;      // [3*ng] group normal (push side = particle side)
-    real* d_gd = nullptr;      // [ng] plane offset: s = n.x + d, penetrating if s < -eps
+    real* d_gd = nullptr;      // [ng] s = dot(n,x)+d; kernel must handle EITHER sign (push along n*sign(s))
     real* d_fp = nullptr;      // [9*n_fp] footprints (3 verts each), row-major
     int* d_fp_start = nullptr; // [ng+1] footprint offset per group
     real* d_mu = nullptr;      // [ng] friction (min particle/wall applied in kernel)
