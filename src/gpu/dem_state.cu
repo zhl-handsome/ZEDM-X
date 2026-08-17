@@ -393,6 +393,15 @@ void GpuSim::upload(const SimConfig& cfg) {
     gravity[1] = static_cast<real>(cfg.gravity.y);
     gravity[2] = static_cast<real>(cfg.gravity.z);
     tangential_damping = static_cast<real>(cfg.tangential_damping);
+    {
+        real g3[3] = {gravity[0], gravity[1], gravity[2]};
+        d_gravity = upload_array(g3, 3);
+    }
+
+    // Host registry copies for periodic VTK output (body-frame meshes +
+    // initial particle array; dynamic fields refreshed by download_frame).
+    host_meshes = std::move(meshes);
+    host_particles = particles;
 
     // Checksum echo: sum the exact staged values (real -> double) in buffer
     // order, right before/after the device copy. Same summation order as the
@@ -423,6 +432,10 @@ void GpuSim::free_all() {
     free_buf(P.mesh_index);
     free_buf(P.force); free_buf(P.torque); free_buf(P.contact_count);
     P.n = 0;
+    free_buf(d_gravity);
+    d_gravity = nullptr;
+    host_meshes.clear();
+    host_particles.clear();
 }
 
 void GpuSim::download_soa(std::vector<double>& pos, std::vector<double>& vel,
@@ -439,4 +452,36 @@ void GpuSim::download_soa(std::vector<double>& pos, std::vector<double>& vel,
     for (std::size_t k = 0; k < n3; ++k) vel[k] = static_cast<double>(tmp[k]);
     CUDA_CHECK(cudaMemcpy(tmp.data(), P.omega, n3 * sizeof(real), cudaMemcpyDeviceToHost));
     for (std::size_t k = 0; k < n3; ++k) omega[k] = static_cast<double>(tmp[k]);
+}
+
+void GpuSim::download_frame(std::vector<double>& pos, std::vector<double>& vel,
+                            std::vector<double>& omega, std::vector<double>& quat,
+                            std::vector<double>& force, std::vector<double>& torque,
+                            std::vector<int>& contact_count) const {
+    const std::size_t n = static_cast<std::size_t>(P.n);
+    const std::size_t n3 = 3 * n;
+    const std::size_t n4 = 4 * n;
+    pos.assign(n3, 0.0);
+    vel.assign(n3, 0.0);
+    omega.assign(n3, 0.0);
+    quat.assign(n4, 0.0);
+    force.assign(n3, 0.0);
+    torque.assign(n3, 0.0);
+    contact_count.assign(n, 0);
+    if (n == 0) return;
+    std::vector<real> tmp(std::max(n3, n4));
+    CUDA_CHECK(cudaMemcpy(tmp.data(), P.pos, n3 * sizeof(real), cudaMemcpyDeviceToHost));
+    for (std::size_t k = 0; k < n3; ++k) pos[k] = static_cast<double>(tmp[k]);
+    CUDA_CHECK(cudaMemcpy(tmp.data(), P.vel, n3 * sizeof(real), cudaMemcpyDeviceToHost));
+    for (std::size_t k = 0; k < n3; ++k) vel[k] = static_cast<double>(tmp[k]);
+    CUDA_CHECK(cudaMemcpy(tmp.data(), P.omega, n3 * sizeof(real), cudaMemcpyDeviceToHost));
+    for (std::size_t k = 0; k < n3; ++k) omega[k] = static_cast<double>(tmp[k]);
+    CUDA_CHECK(cudaMemcpy(tmp.data(), P.quat, n4 * sizeof(real), cudaMemcpyDeviceToHost));
+    for (std::size_t k = 0; k < n4; ++k) quat[k] = static_cast<double>(tmp[k]);
+    CUDA_CHECK(cudaMemcpy(tmp.data(), P.force, n3 * sizeof(real), cudaMemcpyDeviceToHost));
+    for (std::size_t k = 0; k < n3; ++k) force[k] = static_cast<double>(tmp[k]);
+    CUDA_CHECK(cudaMemcpy(tmp.data(), P.torque, n3 * sizeof(real), cudaMemcpyDeviceToHost));
+    for (std::size_t k = 0; k < n3; ++k) torque[k] = static_cast<double>(tmp[k]);
+    CUDA_CHECK(cudaMemcpy(contact_count.data(), P.contact_count,
+                          n * sizeof(int), cudaMemcpyDeviceToHost));
 }

@@ -16,6 +16,7 @@
 
 #include "gpu/real.hpp"
 #include "host/config_io.hpp"
+#include "host/vtk_io.hpp"  // Particle (+ Mesh via geometry/mesh.hpp)
 
 struct DeviceMeshes {          // flattened body-frame mesh registry
     // vertices: 3*total_v floats, tris: 3*total_t ints (vertex indices, GLOBAL)
@@ -50,6 +51,14 @@ class GpuSim {
 public:
     DeviceParticles P; DeviceMeshes M; DeviceWalls W;
     real dt = 0; real gravity[3] = {0, 0, 0}; real tangential_damping = 0;
+    real* d_gravity = nullptr;          // [3] device copy of gravity
+    // Host registry copies kept from upload() for periodic VTK output: the
+    // mesh registry (body frame; write_vtk_particles rotates to world with
+    // the per-particle quaternion) and the initial Particle array (static
+    // fields mass/radius/mesh_index; dynamic fields overwritten per output
+    // from download_frame before writing).
+    std::vector<Mesh> host_meshes;
+    std::vector<Particle> host_particles;
     // Task-3 checksum echo: sums of the exact staged (real-typed) values that
     // were uploaded, computed on the host right before the device copy. The
     // --check-sums mode compares these against a device roundtrip; identical
@@ -60,4 +69,10 @@ public:
     void free_all();
     void download_soa(std::vector<double>& pos, std::vector<double>& vel,
                       std::vector<double>& omega) const;  // for output/verification
+    // Full frame download for VTK output: pos/vel/omega/quat/force/torque
+    // (real -> double) + contact_count.
+    void download_frame(std::vector<double>& pos, std::vector<double>& vel,
+                        std::vector<double>& omega, std::vector<double>& quat,
+                        std::vector<double>& force, std::vector<double>& torque,
+                        std::vector<int>& contact_count) const;
 };
