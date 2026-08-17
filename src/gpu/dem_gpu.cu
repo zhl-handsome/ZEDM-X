@@ -21,6 +21,7 @@
 #include "gpu/dem_state.cuh"
 #include "gpu/kernels/broadphase.cuh"
 #include "gpu/kernels/integrate.cuh"
+#include "gpu/kernels/pp_contact.cuh"
 #include "gpu/kernels/wall_contact.cuh"
 #include "gpu/real.hpp"
 #include "host/config_io.hpp"
@@ -198,6 +199,40 @@ int main(int argc, char** argv) {
                                  "(total %d), stored list clamped\n",
                                  sim.BP.capacity, bp.n_pairs);
                     pairs_overflow_warned = true;
+                }
+            }
+            // Particle-particle containment penalty kernel (Task 7): one
+            // block per candidate pair. Launch count is read back to the
+            // host per step (4-byte D2H of the broadphase total, ordered
+            // after run_broadphase on the same stream). Pairs beyond the
+            // persistent buffer's capacity are skipped with a one-time
+            // warning (the stored list is clamped; matches the dump path).
+            if (sim.BP.d_offsets != nullptr) {
+                int n_pairs = peek_pair_count(sim);
+                if (n_pairs > sim.BP.capacity) {
+                    if (!pairs_overflow_warned) {
+                        std::fprintf(stderr,
+                                     "WARNING: broadphase pair capacity %d exceeded "
+                                     "(total %d), pp_contact processes only the stored "
+                                     "%d pairs\n",
+                                     sim.BP.capacity, n_pairs, sim.BP.capacity);
+                        pairs_overflow_warned = true;
+                    }
+                    n_pairs = sim.BP.capacity;
+                }
+                if (n_pairs > 0) {
+                    pp_contact_kernel<<<n_pairs, kThreads>>>(
+                        sim.P.pos, sim.P.quat, sim.P.vel, sim.P.omega,
+                        sim.P.inv_mass, sim.P.radius, sim.P.equiv_radius,
+                        sim.P.young, sim.P.poisson, sim.P.mu, sim.P.restitution,
+                        sim.P.mesh_index,
+                        sim.M.d_verts, sim.M.d_tris, sim.M.d_voffset,
+                        sim.M.d_toffset,
+                        sim.BP.d_pairs, n_pairs,
+                        sim.tangential_damping,
+                        sim.P.force, sim.P.torque, sim.P.contact_count,
+                        sim.P.contacts);
+                    CUDA_CHECK(cudaGetLastError());
                 }
             }
             integrate_kernel<<<blocks, kThreads>>>(
