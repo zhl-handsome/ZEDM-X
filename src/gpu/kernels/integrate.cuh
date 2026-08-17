@@ -44,19 +44,26 @@ __device__ inline void quat_mul_device(const real a[4], const real b[4], real ou
     out[3] = a[0]*b[3] + a[1]*b[2] - a[2]*b[1] + a[3]*b[0];
 }
 
-// Rotate v by q (q = {w,x,y,z}): v + 2*qv x (qv x v + w*v), matches CPU
-// quat_rotate for a unit quaternion.
+// Rotate v by q (q = {w,x,y,z}): v + 2*qv x (qv x v + w*v). q is normalized
+// first so config-supplied non-unit quaternions match CPU quat_rotate (which
+// normalizes internally). A degenerate norm == 0 returns v unchanged.
 __device__ inline void quat_rotate_device(const real q[4], const real v[3], real out[3]) {
-    real qv[3] = {q[1], q[2], q[3]};
+    real n = r_sqrt(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
+    if (n == real(0)) {
+        out[0] = v[0]; out[1] = v[1]; out[2] = v[2];
+        return;
+    }
+    real qw = q[0] / n;
+    real qv[3] = {q[1] / n, q[2] / n, q[3] / n};
     real c[3] = {qv[1]*v[2] - qv[2]*v[1],
                  qv[2]*v[0] - qv[0]*v[2],
                  qv[0]*v[1] - qv[1]*v[0]};
     real cc[3] = {qv[1]*c[2] - qv[2]*c[1],
                   qv[2]*c[0] - qv[0]*c[2],
                   qv[0]*c[1] - qv[1]*c[0]};
-    out[0] = v[0] + real(2)*(q[0]*c[0] + cc[0]);
-    out[1] = v[1] + real(2)*(q[0]*c[1] + cc[1]);
-    out[2] = v[2] + real(2)*(q[0]*c[2] + cc[2]);
+    out[0] = v[0] + real(2)*(qw*c[0] + cc[0]);
+    out[1] = v[1] + real(2)*(qw*c[1] + cc[1]);
+    out[2] = v[2] + real(2)*(qw*c[2] + cc[2]);
 }
 
 // Exact exponential rotation increment for a world-frame angular velocity:
