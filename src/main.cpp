@@ -74,81 +74,6 @@ struct Wall {
     std::vector<Vec3> tri_normals;
 };
 
-struct WallPatchKey {
-    int particle_idx = -1;
-    int wall_idx = -1;
-    int nx = 0;
-    int ny = 0;
-    int nz = 0;
-    int d = 0;
-
-    bool operator==(const WallPatchKey& o) const {
-        return particle_idx == o.particle_idx &&
-               wall_idx == o.wall_idx &&
-               nx == o.nx &&
-               ny == o.ny &&
-               nz == o.nz &&
-               d == o.d;
-    }
-};
-
-struct WallHistoryKey {
-    int particle_idx = -1;
-    int wall_idx = -1;
-    int nx = 0;
-    int ny = 0;
-    int nz = 0;
-    int d = 0;
-    int cx = 0;
-    int cy = 0;
-    int cz = 0;
-
-    bool operator==(const WallHistoryKey& o) const {
-        return particle_idx == o.particle_idx &&
-               wall_idx == o.wall_idx &&
-               nx == o.nx &&
-               ny == o.ny &&
-               nz == o.nz &&
-               d == o.d &&
-               cx == o.cx &&
-               cy == o.cy &&
-               cz == o.cz;
-    }
-};
-
-struct WallHistoryKeyHash {
-    std::size_t operator()(const WallHistoryKey& k) const {
-        std::size_t h = std::hash<int>{}(k.particle_idx);
-        h ^= std::hash<int>{}(k.wall_idx) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<int>{}(k.nx) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<int>{}(k.ny) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<int>{}(k.nz) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<int>{}(k.d) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<int>{}(k.cx) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<int>{}(k.cy) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<int>{}(k.cz) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        return h;
-    }
-};
-
-struct WallPatchAccum {
-    double area_sum = 0.0;
-    double penetration_max = 0.0;
-    Vec3 weighted_contact_sum{0.0, 0.0, 0.0};
-    Vec3 normal_sum{0.0, 0.0, 0.0};
-    int tri_count = 0;
-    int section_loop_count = 0;
-};
-
-struct WallContactCandidate {
-    WallPatchKey plane_key;
-    double area = 0.0;
-    double penetration = 0.0;
-    Vec3 contact_point{0.0, 0.0, 0.0};
-    Vec3 contact_normal{0.0, 0.0, 0.0};
-    std::vector<Vec3> polygon;
-    int section_loop_count = 0;
-};
 
 static bool plane_from_tri(const std::array<Vec3, 3>& tri, Vec3& n, double& d) {
     n = cross(tri[1] - tri[0], tri[2] - tri[0]);
@@ -802,6 +727,18 @@ static Vec3 unproject_to_3d(const Vec2& p2d, const Vec3& origin, const Vec3& u, 
     return origin + u * p2d.x + v * p2d.y;
 }
 
+// Point-in-triangle (2D, inclusive of the boundary) -- footprint test for
+// the finite wall triangles in the per-vertex wall penalty contact.
+static bool point_in_tri_2d(const Vec2& p, const Vec2& a, const Vec2& b, const Vec2& c) {
+    auto sign = [](const Vec2& p1, const Vec2& p2, const Vec2& p3) {
+        return (p1.x - p3.x) * (p2.y - p3.y) - (p2.x - p3.x) * (p1.y - p3.y);
+    };
+    double d1 = sign(p, a, b), d2 = sign(p, b, c), d3 = sign(p, c, a);
+    bool has_neg = (d1 < 0.0) || (d2 < 0.0) || (d3 < 0.0);
+    bool has_pos = (d1 > 0.0) || (d2 > 0.0) || (d3 > 0.0);
+    return !(has_neg && has_pos);
+}
+
 static std::vector<std::vector<Vec3>> get_particle_plane_section_loops(const Mesh& mesh,
                                                                        const Transform& tf,
                                                                        const Vec3& plane_n,
@@ -881,76 +818,6 @@ static std::vector<std::vector<Vec3>> get_particle_plane_section_loops(const Mes
     return loops;
 }
 
-// Reconstruct all wall-plane section loops, then clip each loop by one wall triangle.
-static void compute_wall_contacts(const Mesh& particle_mesh, const Transform& particle_tf,
-                                  const std::array<Vec3, 3>& wall_tri,
-                                  double tol,
-                                  std::vector<WallContactCandidate>& out_contacts) {
-    out_contacts.clear();
-    Vec3 edge1 = wall_tri[1] - wall_tri[0];
-    Vec3 edge2 = wall_tri[2] - wall_tri[0];
-    Vec3 plane_n = normalize(cross(edge1, edge2));
-    double plane_d = -dot(plane_n, wall_tri[0]);
-
-    std::vector<std::vector<Vec3>> section_loops = get_particle_plane_section_loops(
-        particle_mesh, particle_tf, plane_n, plane_d, tol);
-    if (section_loops.empty()) {
-        return;
-    }
-
-    Vec3 basis_u, basis_v;
-    build_basis(plane_n, basis_u, basis_v);
-    Vec3 origin = wall_tri[0];
-
-    std::vector<Vec2> clip_2d;
-    for (const auto& p : wall_tri) {
-        clip_2d.push_back(project_to_2d(p, origin, basis_u, basis_v));
-    }
-
-    std::vector<Vec3> world_vertices;
-    for (const auto& v : particle_mesh.vertices) {
-        Vec3 world_v = quat_rotate(particle_tf.rot, v) + particle_tf.pos;
-        world_vertices.push_back(world_v);
-    }
-
-    double s_min = std::numeric_limits<double>::infinity();
-    for (const Vec3& v_world : world_vertices) {
-        double s = dot(plane_n, v_world) + plane_d;
-        s_min = std::min(s_min, s);
-    }
-    double penetration = std::max(0.0, -s_min);
-
-    for (const auto& loop : section_loops) {
-        std::vector<Vec2> subject_2d;
-        subject_2d.reserve(loop.size());
-        for (const auto& p : loop) {
-            subject_2d.push_back(project_to_2d(p, origin, basis_u, basis_v));
-        }
-
-        std::vector<Vec2> clipped = sutherland_hodgman_clip(subject_2d, clip_2d);
-        if (clipped.size() < 3) {
-            continue;
-        }
-
-        double area = polygon_area_2d(clipped);
-        if (area < tol * tol * 0.01) {
-            continue;
-        }
-
-        Vec2 centroid_2d = polygon_centroid_2d(clipped);
-        WallContactCandidate contact;
-        contact.area = area;
-        contact.penetration = penetration;
-        contact.contact_point = unproject_to_3d(centroid_2d, origin, basis_u, basis_v);
-        contact.contact_normal = plane_n;
-        contact.section_loop_count = static_cast<int>(section_loops.size());
-        contact.polygon.reserve(clipped.size());
-        for (const Vec2& p2d : clipped) {
-            contact.polygon.push_back(unproject_to_3d(p2d, origin, basis_u, basis_v));
-        }
-        out_contacts.push_back(contact);
-    }
-}
 
 static Vec3 support_point(const Mesh& mesh, const Transform& tf, const Vec3& dir) {
     Quat qc = quat_conj(tf.rot);
@@ -1739,16 +1606,9 @@ int main(int argc, char** argv) {
         std::cout << "Loaded wall: " << wi.stl_path << " (tris=" << wall.mesh.tris.size() << ")\n";
     }
 
-    std::unordered_map<WallHistoryKey, Vec3, WallHistoryKeyHash> wall_tangential_disp;
-
     std::vector<Vec3> forces(particles.size());
     std::vector<Vec3> torques(particles.size());
     std::vector<int> contact_counts(particles.size());
-    std::unordered_map<long long, Vec3> tangential_disp;
-    // Per-pair persistent contact state: kinematic normal penetration and the
-    // locked interface normal (see particle-particle contact for rationale).
-    std::unordered_map<long long, double> pair_normal_pen;
-    std::unordered_map<long long, Vec3> pair_locked_normal;
 
     std::filesystem::create_directories(cfg.output_dir);
 
@@ -1759,7 +1619,6 @@ int main(int argc, char** argv) {
         std::fill(contact_counts.begin(), contact_counts.end(), 0);
 
         int contacts = 0;
-        std::unordered_set<long long> active_pairs;
         std::size_t total_segments = 0;
         std::size_t total_loops = 0;
         std::size_t total_comps = 0;
@@ -1866,52 +1725,131 @@ int main(int argc, char** argv) {
                 }
                 t_tri += std::chrono::steady_clock::now() - t0;
 
-                if (segments.empty()) {
-                    // Residual contact: the intersection loop can vanish while the meshes
-                    // are still deeply overlapped (one surface fully swallowing the other),
-                    // which used to leave a zero-force gap the particles tunneled through.
-                    // Keep pushing apart with the locked normal and the kinematic
-                    // penetration state until it drains to zero.
-                    auto pen_it = pair_normal_pen.find(pair_key);
-                    if (pen_it != pair_normal_pen.end() && pen_it->second > 1e-9) {
-                        auto n_it = pair_locked_normal.find(pair_key);
-                        if (n_it != pair_locked_normal.end()) {
-                            Vec3 nL = n_it->second;
-                            Vec3 xc_mid = (pa.tf.pos + pb.tf.pos) * 0.5;
-                            Vec3 rAm = xc_mid - pa.tf.pos;
-                            Vec3 rBm = xc_mid - pb.tf.pos;
-                            Vec3 vAm = pa.vel + cross(pa.omega, rAm);
-                            Vec3 vBm = pb.vel + cross(pb.omega, rBm);
-                            double vnm = dot(vBm - vAm, nL);
-                            double& pen_s = pen_it->second;
-                            pen_s -= vnm * cfg.dt;
-                            double Rp1 = std::max(pa.equiv_radius, 1e-12);
-                            double Rp2 = std::max(pb.equiv_radius, 1e-12);
-                            pen_s = std::min(std::max(pen_s, 0.0), 0.3 * std::min(Rp1, Rp2));
-                            double E1r = std::max(pa.young, 1e-12);
-                            double E2r = std::max(pb.young, 1e-12);
-                            double nu1r = pa.poisson, nu2r = pb.poisson;
-                            double Estar_r = 1.0 / ((1.0 - nu1r * nu1r) / E1r + (1.0 - nu2r * nu2r) / E2r);
-                            double Rstar_r = (Rp1 * Rp2) / std::max(Rp1 + Rp2, 1e-12);
-                            double k_hr = (4.0 / 3.0) * Estar_r * std::sqrt(Rstar_r);
-                            double kn_eff_r = 1.5 * k_hr * std::sqrt(std::max(pen_s, 1e-12));
-                            double m_eff_r = 1.0 / (pa.inv_mass + pb.inv_mass);
-                            double e_r = std::min(pa.restitution, pb.restitution);
-                            e_r = std::min(0.9999, std::max(1e-6, e_r));
-                            double loge_r = std::log(e_r);
-                            double cn_r = std::abs(2.0 * loge_r * std::sqrt(kn_eff_r * m_eff_r) /
-                                std::sqrt(loge_r * loge_r + 3.141592653589793 * 3.141592653589793));
-                            double fnr = k_hr * pen_s * std::sqrt(pen_s);
-                            if (vnm < 0.0) fnr += -cn_r * vnm;
-                            if (fnr < 0.0) fnr = 0.0;
-                            Vec3 fnv = nL * fnr;
-                            forces[i] -= fnv;
-                            forces[j] += fnv;
-                            torques[i] += cross(rAm, fnv * -1.0);
-                            torques[j] += cross(rBm, fnv);
-                            active_pairs.insert(pair_key);
+                // ============== Containment scan ==============
+                // Vertices that have crossed INTO the other mesh: the earliest
+                // contact signal for concave shapes. The segment pipeline stays
+                // blind while a vertex slides through the other body's bay -- the
+                // first loop used to appear with the vertex already 30 mm deep,
+                // and loading the full Hertz force on that overlap teleported
+                // (2/5)*kh*pen^2.5 ~ 57 J of potential energy into a 0.1 J impact.
+                // Each hit records (vertex, closest surface point, depth): that
+                // pair of material points is one penalty contact element.
+                std::vector<Vec3> incA, incB;          // contained vertices
+                std::vector<Vec3> incA_cp, incB_cp;    // their closest points on the other surface
+                std::vector<double> incA_d, incB_d;    // depths |vertex - closest|
+                {
+                    Vec3 bmn = trisB[0][0], bmx = trisB[0][0];
+                    for (const auto& t : trisB) {
+                        for (const auto& c : t) {
+                            bmn.x = std::min(bmn.x, c.x); bmn.y = std::min(bmn.y, c.y); bmn.z = std::min(bmn.z, c.z);
+                            bmx.x = std::max(bmx.x, c.x); bmx.y = std::max(bmx.y, c.y); bmx.z = std::max(bmx.z, c.z);
                         }
                     }
+                    for (const auto& v : meshA.vertices) {
+                        Vec3 wv = quat_rotate(pa.tf.rot, v) + pa.tf.pos;
+                        if (wv.x < bmn.x || wv.x > bmx.x || wv.y < bmn.y || wv.y > bmx.y || wv.z < bmn.z || wv.z > bmx.z) continue;
+                        if (!point_inside_mesh(trisB, wv)) continue;
+                        Vec3 cp, nf; double d = point_mesh_distance(trisB, wv, cp, nf);
+                        if (d <= 1e-12) continue;
+                        incA.push_back(wv); incA_cp.push_back(cp); incA_d.push_back(d);
+                    }
+                    Vec3 amn = trisA[0][0], amx = trisA[0][0];
+                    for (const auto& t : trisA) {
+                        for (const auto& c : t) {
+                            amn.x = std::min(amn.x, c.x); amn.y = std::min(amn.y, c.y); amn.z = std::min(amn.z, c.z);
+                            amx.x = std::max(amx.x, c.x); amx.y = std::max(amx.y, c.y); amx.z = std::max(amx.z, c.z);
+                        }
+                    }
+                    for (const auto& v : meshB.vertices) {
+                        Vec3 wv = quat_rotate(pb.tf.rot, v) + pb.tf.pos;
+                        if (wv.x < amn.x || wv.x > amx.x || wv.y < amn.y || wv.y > amx.y || wv.z < amn.z || wv.z > amx.z) continue;
+                        if (!point_inside_mesh(trisA, wv)) continue;
+                        Vec3 cp, nf; double d = point_mesh_distance(trisA, wv, cp, nf);
+                        if (d <= 1e-12) continue;
+                        incB.push_back(wv); incB_cp.push_back(cp); incB_d.push_back(d);
+                    }
+                }
+
+                if (!incA.empty() || !incB.empty()) {
+                    // ============== Per-vertex penalty contact ==============
+                    // Each contained vertex and its closest point on the other
+                    // surface form ONE contact element: the spring length is the
+                    // depth d, and the force acts on exactly the two material
+                    // points whose separation defines d. The spring's rate of
+                    // change therefore equals the relative velocity of the very
+                    // points the force acts on -- dU/dt = F.v holds by
+                    // construction. Single-point forms (loop contact point,
+                    // weighted average, deepest vertex) all mismatched the
+                    // driving quantity's time derivative against the force's
+                    // application point under spin and injected up to kJ.
+                    // The push direction is -(vertex - closest)/d: winding-free
+                    // (this STL's face windings are NOT consistent, 19/102 faces
+                    // point inward), always from the surface point away from the
+                    // interior point, i.e. the separation direction.
+                    double Rp1 = std::max(pa.equiv_radius, 1e-12);
+                    double Rp2 = std::max(pb.equiv_radius, 1e-12);
+                    double E1r = std::max(pa.young, 1e-12);
+                    double E2r = std::max(pb.young, 1e-12);
+                    double Estar_r = 1.0 / ((1.0 - pa.poisson * pa.poisson) / E1r + (1.0 - pb.poisson * pb.poisson) / E2r);
+                    double Rstar_r = (Rp1 * Rp2) / std::max(Rp1 + Rp2, 1e-12);
+                    double k_hr = (4.0 / 3.0) * Estar_r * std::sqrt(Rstar_r);
+                    double kt_r = 0.5 * ((E1r * Rp1) / (2.0 * (1.0 + pa.poisson)) + (E2r * Rp2) / (2.0 * (1.0 + pb.poisson)));
+                    double m_eff_r = 1.0 / (pa.inv_mass + pb.inv_mass);
+                    int n_inc = static_cast<int>(incA.size() + incB.size());
+                    double m_eff_v = m_eff_r / std::max(n_inc, 1);  // each vertex carries its mass share
+                    double e_r = std::min(pa.restitution, pb.restitution);
+                    e_r = std::min(0.9999, std::max(1e-6, e_r));
+                    double loge_r = std::log(e_r);
+                    double pi2 = 3.141592653589793 * 3.141592653589793;
+                    double ct_v = cfg.tangential_damping * std::sqrt(kt_r * m_eff_v);
+                    double mu_r = std::min(pa.mu, pb.mu);
+                    auto apply_penalty = [&](const Vec3& wv, const Vec3& cp, double d,
+                                             const Particle& p_own, const Particle& p_other,
+                                             int i_own, int i_other) {
+                        Vec3 u = (wv - cp) * (1.0 / std::max(d, 1e-15));  // surface -> interior
+                        Vec3 n_push = u * -1.0;                            // separation direction
+                        Vec3 v_own = p_own.vel + cross(p_own.omega, wv - p_own.tf.pos);
+                        Vec3 v_oth = p_other.vel + cross(p_other.omega, cp - p_other.tf.pos);
+                        Vec3 vrel = v_own - v_oth;
+                        double vn = dot(vrel, n_push);  // <0 = penetrating deeper
+                        double kn_eff_v = 1.5 * k_hr * std::sqrt(std::max(d, 1e-12));
+                        double cn_v = std::abs(2.0 * loge_r * std::sqrt(kn_eff_v * m_eff_v) /
+                            std::sqrt(loge_r * loge_r + pi2));
+                        double fn_v = k_hr * d * std::sqrt(d);
+                        if (vn < 0.0) fn_v += -cn_v * vn;
+                        if (fn_v < 0.0) fn_v = 0.0;
+                        Vec3 fn_vec = n_push * fn_v;
+                        forces[i_own] += fn_vec;
+                        forces[i_other] -= fn_vec;
+                        torques[i_own] += cross(wv - p_own.tf.pos, fn_vec);
+                        torques[i_other] += cross(cp - p_other.tf.pos, fn_vec * -1.0);
+                        // Tangential friction at the same pair of points
+                        Vec3 vt = vrel - n_push * vn;
+                        Vec3 ft_v = vt * (-ct_v);
+                        double ftv_norm = norm(ft_v);
+                        double ftv_max = mu_r * fn_v;
+                        if (ftv_norm > ftv_max && ftv_norm > 1e-14) {
+                            ft_v = ft_v * (ftv_max / ftv_norm);
+                        }
+                        forces[i_own] += ft_v;
+                        forces[i_other] -= ft_v;
+                        torques[i_own] += cross(wv - p_own.tf.pos, ft_v);
+                        torques[i_other] += cross(cp - p_other.tf.pos, ft_v * -1.0);
+                    };
+                    for (std::size_t k = 0; k < incA.size(); ++k) {
+                        apply_penalty(incA[k], incA_cp[k], incA_d[k], pa, pb, i, j);
+                    }
+                    for (std::size_t k = 0; k < incB.size(); ++k) {
+                        apply_penalty(incB[k], incB_cp[k], incB_d[k], pb, pa, j, i);
+                    }
+                    contact_counts[i] += 1;
+                    contact_counts[j] += 1;
+                    contacts++;
+                    // Containment fully covers this pair; skip the loop pipeline.
+                    continue;
+                }
+
+                if (segments.empty()) {
                     continue;
                 }
 
@@ -1929,242 +1867,37 @@ int main(int argc, char** argv) {
                 total_segments += segments.size();
                 total_comps += comps.size();
 
+                // Loop tracing (telemetry only): the per-vertex containment
+                // penalty above fully covers this pair's contact force.
+                // Edge-edge touches before any vertex actually crosses have a
+                // brief force-free grace period (the vertex crosses within
+                // ~a mean edge of travel).
                 for (const auto& comp : comps) {
                     std::vector<std::pair<Vec3, Vec3>> segs;
                     segs.reserve(comp.size());
                     for (int idx : comp) {
                         segs.push_back(segments[idx]);
                     }
-
                     std::vector<Vec3> V;
                     std::vector<std::pair<int, int>> edges;
                     snap_endpoints(segs, tol, V, edges);
-
                     std::vector<Vec3> V2;
                     std::vector<std::pair<int, int>> edges2;
                     split_t_junctions(V, edges, tol, V2, edges2);
-
                     std::vector<std::vector<int>> loops_vids = extract_loops(V2, edges2);
-                    if (loops_vids.empty()) {
-                        continue;
-                    }
                     total_loops += loops_vids.size();
-
-                    for (const auto& lv : loops_vids) {
-                        if (lv.size() < 3) {
-                            continue;
-                        }
-                        std::vector<Vec3> loop_pts;
-                        loop_pts.reserve(lv.size());
-                        for (int vid : lv) {
-                            loop_pts.push_back(V2[vid]);
-                        }
-                        Vec3 Sn, Gn;
-                        auto acc = accumulate_Sn_Gn_from_polyline(loop_pts);
-                        Sn = acc.first;
-                        Gn = acc.second;
-                        Vec3 xc0, nA;
-                        double area = 0.0;
-                        if (!contact_point_xc0(Sn, Gn, xc0, nA, area)) {
-                            continue;
-                        }
-                        double area_eps = meshA.mean_edge > 0.0 ? (meshA.mean_edge * meshA.mean_edge * 1e-4) : 1e-12;
-                        if (area < area_eps) {
-                            continue;
-                        }
-                        Vec3 dirAB = pb.tf.pos - pa.tf.pos;
-                        if (dot(nA, dirAB) < 0.0) {
-                            // std::reverse(loop_pts.begin(), loop_pts.end());
-                            // acc = accumulate_Sn_Gn_from_polyline(loop_pts);
-                            // Sn = acc.first;
-                            // Gn = acc.second;
-                            // if (!contact_point_xc0(Sn, Gn, xc0, nA, area)) {
-                            //     continue;
-                            // }
-                            nA = nA * -1.0;
-                        }
-                        // Lock the contact normal for the lifetime of this persistent pair:
-                        // the loop-derived nA flips up to 90 degrees when the intersection
-                        // loop re-forms on different faces mid-impact, injecting energy.
-                        // Collisions are short, so the first-detection normal is kept.
-                        if (pair_locked_normal.find(pair_key) == pair_locked_normal.end()) {
-                            pair_locked_normal.emplace(pair_key, nA);
-                            pair_normal_pen.emplace(pair_key, 0.0);
-                        }
-                        nA = pair_locked_normal[pair_key];
-                        // Continuous contact point: penetration-depth-weighted average of
-                        // vertices crossing the interface. Weights max(0, s) vanish smoothly
-                        // at the patch edge, so the point stays continuous as facets enter/
-                        // leave -- unlike the loop-derived xc0, which steps discretely and
-                        // injects energy through the torque arm and the omega x r velocity.
-                        // EVERYTHING downstream (arms, velocities, penetration) uses it.
-                        Vec3 xc_num{0.0, 0.0, 0.0}; double xc_den = 0.0;
-                        {
-                            double rc2 = 4.0 * area;
-                            for (const auto& v : meshA.vertices) {
-                                Vec3 wv = quat_rotate(pa.tf.rot, v) + pa.tf.pos;
-                                if (norm2(wv - xc0) > rc2) continue;
-                                double w = std::max(0.0, dot(nA, wv - xc0));
-                                if (w > 1e-12) { xc_num = xc_num + wv * w; xc_den += w; }
-                            }
-                            for (const auto& v : meshB.vertices) {
-                                Vec3 wv = quat_rotate(pb.tf.rot, v) + pb.tf.pos;
-                                if (norm2(wv - xc0) > rc2) continue;
-                                double w = std::max(0.0, -dot(nA, wv - xc0));
-                                if (w > 1e-12) { xc_num = xc_num + wv * w; xc_den += w; }
-                            }
-                        }
-                        Vec3 xc_cont = (xc_den > 1e-18) ? (xc_num / xc_den) : xc0;
-                        Vec3 rA = xc_cont - pa.tf.pos;
-                        Vec3 rB = xc_cont - pb.tf.pos;
-                        Vec3 vA = pa.vel + cross(pa.omega, rA);
-                        Vec3 vB = pb.vel + cross(pb.omega, rB);
-                        Vec3 vrel = vB - vA;
-                        double vn = dot(vrel, nA);
-
-                        double R1 = std::max(pa.equiv_radius, 1e-12);
-                        double R2 = std::max(pb.equiv_radius, 1e-12);
-                        double E1 = std::max(pa.young, 1e-12);
-                        double E2 = std::max(pb.young, 1e-12);
-                        double nu1 = pa.poisson;
-                        double nu2 = pb.poisson;
-                        double A_n = area;
-
-                        // Continuous Hertz contact (mirrors the wall-contact fix).
-                        // The loop-derived area A_n is a step function of relative pose:
-                        // Fn proportional to An^1.5 jumps as facets enter/leave the overlap
-                        // and injected ~58 kJ into a 0.1 J collision (two-particle impact
-                        // test), and the normal damping was additionally commented out.
-                        // Drive the force by the deepest vertex penetration instead
-                        // (Lipschitz-continuous in the motion; convex approximation for
-                        // concave regions, acceptable as a force law).
-                        // Kinematic (Cundall-style) penetration: integrate the relative
-                        // normal displacement instead of measuring the overlap geometry.
-                        // The interface-plane thickness intermittently read zero while the
-                        // meshes were clearly overlapped (force gaps of ~1200 steps), then
-                        // snapped back with the flipped normal -- both inject energy. The
-                        // integrated penetration is continuous by construction and starts
-                        // from zero at first detection.
-                        {
-                            double& pen_s = pair_normal_pen[pair_key];
-                            pen_s -= vn * cfg.dt;
-                            pen_s = std::min(std::max(pen_s, 0.0), 0.3 * std::min(R1, R2));
-                        }
-                        double pen = pair_normal_pen[pair_key];
-                        double Estar = 1.0 / ((1.0 - nu1 * nu1) / E1 + (1.0 - nu2 * nu2) / E2);
-                        double Rstar = (R1 * R2) / std::max(R1 + R2, 1e-12);
-                        double k_h = (4.0 / 3.0) * Estar * std::sqrt(Rstar);
-                        double kn_eff = 1.5 * k_h * std::sqrt(std::max(pen, 1e-12));
-                        // Tangential stiffness: fixed material value (An-independent, continuous)
-                        double kt = 0.5 * ((E1 * R1) / (2.0 * (1.0 + nu1)) + (E2 * R2) / (2.0 * (1.0 + nu2)));
-                        double m_eff = 1.0 / (pa.inv_mass + pb.inv_mass);
-                        double e = std::min(pa.restitution, pb.restitution);
-                        e = std::min(0.9999, std::max(1e-6, e));
-                        double loge = std::log(e);
-                        double cn = 2.0 * loge * std::sqrt(kn_eff * m_eff) / std::sqrt(loge * loge + 3.141592653589793 * 3.141592653589793);
-                        double ct = cfg.tangential_damping * std::sqrt(kt * m_eff);
-                        cn = std::abs(cn);
-                        ct = std::abs(ct);
-
-                        // Hertz normal force + Tsuji damping (re-enabled; was commented out)
-                        double fn_elastic = (pen > 0.0) ? (k_h * pen * std::sqrt(pen)) : 0.0;
-                        double fn_damping = (vn < 0.0) ? (-cn * vn) : 0.0;
-                        double fn = fn_elastic + fn_damping;
-                        if (fn < 0.0) fn = 0.0;
-                        Vec3 fn_vec = nA * fn;
-
-                        // Distributed tangential friction over the contact-patch vertices
-                        // (both sides). A single contact point cannot dissipate spin about
-                        // the contact normal (v_t = omega x r = 0 on the axis) -- proven by
-                        // the wall-contact yaw fix; persistent particle-particle contacts
-                        // (piles) need the same distributed treatment. Each patch vertex
-                        // carries weight = its penetration depth across the interface
-                        // (continuous, vanishes at the patch edge).
-                        Vec3 ft_total{0.0, 0.0, 0.0};
-                        Vec3 torque_ftA{0.0, 0.0, 0.0};
-                        Vec3 torque_ftB{0.0, 0.0, 0.0};
-                        double mu = std::min(pa.mu, pb.mu);
-                        {
-                            double rc2 = 4.0 * A_n;
-                            Vec3 pv[160]; double pw[160]; int pcount = 0;
-                            double wsum = 0.0;
-                            for (const auto& v : meshA.vertices) {
-                                if (pcount >= 160) break;
-                                Vec3 wv = quat_rotate(pa.tf.rot, v) + pa.tf.pos;
-                                if (norm2(wv - xc_cont) > rc2) continue;
-                                double w = std::max(0.0, dot(nA, wv - xc_cont));
-                                if (w <= 1e-12) continue;
-                                pv[pcount] = wv; pw[pcount] = w; wsum += w; ++pcount;
-                            }
-                            for (const auto& v : meshB.vertices) {
-                                if (pcount >= 160) break;
-                                Vec3 wv = quat_rotate(pb.tf.rot, v) + pb.tf.pos;
-                                if (norm2(wv - xc_cont) > rc2) continue;
-                                double w = std::max(0.0, -dot(nA, wv - xc_cont));
-                                if (w <= 1e-12) continue;
-                                pv[pcount] = wv; pw[pcount] = w; wsum += w; ++pcount;
-                            }
-                            if (wsum > 1e-18) {
-                                for (int k = 0; k < pcount; ++k) {
-                                    double w_v = pw[k] / wsum;
-                                    Vec3 wv = pv[k];
-                                    Vec3 vA_s = pa.vel + cross(pa.omega, wv - pa.tf.pos);
-                                    Vec3 vB_s = pb.vel + cross(pb.omega, wv - pb.tf.pos);
-                                    Vec3 vrel_v = vB_s - vA_s;
-                                    double vn_v = dot(vrel_v, nA);
-                                    Vec3 vt_v = vrel_v - nA * vn_v;
-                                    Vec3 ft_v = vt_v * (-ct * w_v);
-                                    double ftv_norm = norm(ft_v);
-                                    double ftv_max = mu * fn * w_v;
-                                    if (ftv_norm > ftv_max && ftv_norm > 1e-14) {
-                                        ft_v = ft_v * (ftv_max / ftv_norm);
-                                    }
-                                    ft_total = ft_total + ft_v;
-                                    torque_ftA = torque_ftA + cross(wv - pa.tf.pos, ft_v * -1.0);
-                                    torque_ftB = torque_ftB + cross(wv - pb.tf.pos, ft_v);
-                                }
-                            }
-                        }
-
-                        // Normal force acts at the continuous contact point; tangential
-                        // torques are already accumulated per vertex.
-                        Vec3 f = fn_vec + ft_total;
-                        forces[i] -= f;
-                        forces[j] += f;
-                        torques[i] += cross(rA, fn_vec * -1.0) + torque_ftA;
-                        torques[j] += cross(rB, fn_vec) + torque_ftB;
-                        active_pairs.insert(pair_key);
-                        contact_counts[i] += 1;
-                        contact_counts[j] += 1;
-                        if (cfg.contact_debug && contacts == 0) {
-                            Vec3 tauA = cross(rA, f);
-                            Vec3 tauB = cross(rB, f * -1.0);
-                            std::cout << "  contact_debug: i=" << i << " j=" << j
-                                      << " xc0=" << xc0.x << "," << xc0.y << "," << xc0.z
-                                      << " n=" << nA.x << "," << nA.y << "," << nA.z
-                                      << " F=" << f.x << "," << f.y << "," << f.z
-                                      << " rA=" << rA.x << "," << rA.y << "," << rA.z
-                                      << " tauA=" << tauA.x << "," << tauA.y << "," << tauA.z
-                                      << " rB=" << rB.x << "," << rB.y << "," << rB.z
-                                      << " tauB=" << tauB.x << "," << tauB.y << "," << tauB.z
-                                      << "\n";
-                        }
-                        contacts++;
-                    }
                 }
                 t_rebuild += std::chrono::steady_clock::now() - t0;
             }
         }
 
         // ============== Particle-Wall Contact Detection ==============
-        std::unordered_set<WallHistoryKey, WallHistoryKeyHash> active_wall_pairs;
         for (int i = 0; i < static_cast<int>(particles.size()); ++i) {
             Particle& p = particles[i];
             const Mesh& pmesh = meshes[p.mesh_index];
 
             for (int w = 0; w < static_cast<int>(walls.size()); ++w) {
                 const Wall& wall = walls[w];
-                std::vector<WallContactCandidate> wall_candidates;
 
                 // Broad phase: check if particle bounding sphere overlaps with wall bounding sphere
                 Vec3 dpos = p.tf.pos - wall.tf.pos;
@@ -2179,197 +1912,132 @@ int main(int argc, char** argv) {
                 double tol = pmesh.mean_edge > 0.0 ? (pmesh.mean_edge * 0.1) : (pmesh.bbox_diag * 1e-2);
                 if (tol <= 0.0) tol = 1e-6;
 
-                // For each wall triangle, check for contact
+                // ============== Wall contact: per-vertex penalty (v8) ==============
+                // Same contact element as particle-particle: every vertex that
+                // crossed a wall plane is one penalty spring acting exactly at
+                // that vertex. Coplanar wall triangles passing the AABB test
+                // are grouped so a vertex in the shared footprint is charged
+                // once (a split plane wall is TWO coplanar triangles -- without
+                // grouping every contact force would be doubled). The old
+                // clip-loop pipeline drove the force by the deepest vertex but
+                // applied it at a depth-weighted average point -- different
+                // material points, the spin-mismatch injection fixed in the
+                // pair contact; after the integrator stopped dissipating
+                // numerically it left the e=0.3 wall case oscillating forever.
+                struct WallPlaneGroup {
+                    Vec3 n; double d;
+                    std::vector<std::array<Vec3, 3>> footprints;
+                };
+                std::vector<WallPlaneGroup> groups;
                 for (std::size_t t = 0; t < wall_tris.size(); ++t) {
                     const auto& wtri = wall_tris[t];
-
-                    // Quick AABB check between particle and wall triangle
                     Vec3 wmn{std::min({wtri[0].x, wtri[1].x, wtri[2].x}),
                              std::min({wtri[0].y, wtri[1].y, wtri[2].y}),
                              std::min({wtri[0].z, wtri[1].z, wtri[2].z})};
                     Vec3 wmx{std::max({wtri[0].x, wtri[1].x, wtri[2].x}),
                              std::max({wtri[0].y, wtri[1].y, wtri[2].y}),
                              std::max({wtri[0].z, wtri[1].z, wtri[2].z})};
-
-                    // Particle AABB
                     Vec3 pmn = p.tf.pos - Vec3{p.radius, p.radius, p.radius};
                     Vec3 pmx = p.tf.pos + Vec3{p.radius, p.radius, p.radius};
-
                     if (pmx.x < wmn.x || pmn.x > wmx.x ||
                         pmx.y < wmn.y || pmn.y > wmx.y ||
                         pmx.z < wmn.z || pmn.z > wmx.z) {
                         continue;
                     }
-
-                    Vec3 plane_normal = tri_normal(wtri);
-                    double plane_d = -dot(plane_normal, wtri[0]);
-                    const double quant = 1e6;
-                    WallPatchKey patch_key;
-                    patch_key.particle_idx = i;
-                    patch_key.wall_idx = w;
-                    patch_key.nx = static_cast<int>(std::llround(plane_normal.x * quant));
-                    patch_key.ny = static_cast<int>(std::llround(plane_normal.y * quant));
-                    patch_key.nz = static_cast<int>(std::llround(plane_normal.z * quant));
-                    patch_key.d = static_cast<int>(std::llround(plane_d * quant));
-
-                    std::vector<WallContactCandidate> tri_contacts;
-                    compute_wall_contacts(pmesh, p.tf, wtri, tol, tri_contacts);
-                    for (auto& candidate : tri_contacts) {
-                        Vec3 to_particle = p.tf.pos - candidate.contact_point;
-                        if (dot(candidate.contact_normal, to_particle) < 0.0) {
-                            candidate.contact_normal = candidate.contact_normal * -1.0;
+                    Vec3 pn = tri_normal(wtri);
+                    if (dot(pn, p.tf.pos - wtri[0]) < 0.0) {
+                        pn = pn * -1.0;  // push toward the particle side
+                    }
+                    double pd = -dot(pn, wtri[0]);
+                    const double pq = 1e6;
+                    bool merged = false;
+                    for (auto& g : groups) {
+                        if (std::llround(g.n.x * pq) == std::llround(pn.x * pq) &&
+                            std::llround(g.n.y * pq) == std::llround(pn.y * pq) &&
+                            std::llround(g.n.z * pq) == std::llround(pn.z * pq) &&
+                            std::llround(g.d * pq) == std::llround(pd * pq)) {
+                            g.footprints.push_back(wtri);
+                            merged = true;
+                            break;
                         }
-                        candidate.plane_key = patch_key;
-                        wall_candidates.push_back(candidate);
+                    }
+                    if (!merged) {
+                        WallPlaneGroup g;
+                        g.n = pn; g.d = pd;
+                        g.footprints.push_back(wtri);
+                        groups.push_back(g);
                     }
                 }
 
-                if (!wall_candidates.empty()) {
-                    WallPatchKey patch_key = wall_candidates.front().plane_key;
-                    WallPatchAccum accum;
-                    for (const WallContactCandidate& candidate : wall_candidates) {
-                        accum.area_sum += candidate.area;
-                        accum.weighted_contact_sum += candidate.contact_point * candidate.area;
-                        accum.normal_sum += candidate.contact_normal * candidate.area;
-                        accum.penetration_max = std::max(accum.penetration_max, candidate.penetration);
-                        accum.tri_count += 1;
-                        accum.section_loop_count = std::max(accum.section_loop_count, candidate.section_loop_count);
-                    }
-                    if (accum.area_sum <= 1e-18) {
-                        continue;
-                    }
+                double Rp = std::max(p.equiv_radius, 1e-12);
+                double Ep = std::max(p.young, 1e-12);
+                double nu_p = p.poisson;
+                double Estar = Ep / (2.0 * (1.0 - nu_p * nu_p));
+                double k_hw = (4.0 / 3.0) * Estar * std::sqrt(Rp);
+                double kt_w = (Ep * Rp) / (2.0 * (1.0 + nu_p));
+                double e_w = std::min(0.9999, std::max(1e-6, p.restitution));
+                double loge_w = std::log(e_w);
+                double pi2 = 3.141592653589793 * 3.141592653589793;
+                double mu_w = std::min(p.mu, wall.mu);
 
-                    Vec3 contact_normal = normalize(accum.normal_sum);
-                    if (norm2(contact_normal) < 1e-20) {
-                        continue;
-                    }
-                    // Continuous contact point: penetration-depth-weighted average of the
-                    // particle's penetrating vertices. Replaces the clipped-polygon centroid
-                    // (weighted_contact_sum/area_sum) which jumps discretely whenever a facet
-                    // enters/leaves the overlap, injecting energy via the torque arm rP. Each
-                    // vertex world position quat_rotate(rot,v)+pos is continuous in the motion,
-                    // and max(0,-s) is continuous, so this point is Lipschitz-continuous.
-                    Vec3 wp_n = wall_candidates.front().contact_normal;
-                    Vec3 wp_p0 = wall_candidates.front().contact_point;
-                    Vec3 cp_acc{0.0, 0.0, 0.0}; double cp_wsum = 0.0;
+                for (const auto& g : groups) {
+                    // Count crossings first so the damping uses each vertex share
+                    // of the particle mass.
+                    int n_cross = 0;
                     for (const auto& v : pmesh.vertices) {
                         Vec3 wv = quat_rotate(p.tf.rot, v) + p.tf.pos;
-                        double s = dot(wp_n, wv - wp_p0);
-                        double delta = std::max(0.0, -s);
-                        if (delta > 1e-12) { cp_acc = cp_acc + wv * delta; cp_wsum += delta; }
+                        double s = dot(g.n, wv) + g.d;
+                        if (s > -1e-12) continue;
+                        Vec3 p_proj = wv - g.n * s;  // drop onto the wall plane
+                        for (const auto& fp : g.footprints) {
+                            if (point_in_tri(p_proj, fp, g.n)) { ++n_cross; break; }
+                        }
                     }
-                    Vec3 contact_point = (cp_wsum > 1e-18) ? (cp_acc / cp_wsum)
-                                                           : (accum.weighted_contact_sum / accum.area_sum);
-
-                    Vec3 rP = contact_point - p.tf.pos;
-                    Vec3 vP = p.vel + cross(p.omega, rP);
-                    Vec3 vrel = vP;  // Wall velocity is zero
-                    double vn = dot(vrel, contact_normal);
-
-                    double Rp = std::max(p.equiv_radius, 1e-12);
-                    double Ep = std::max(p.young, 1e-12);
-                    double nu_p = p.poisson;
-                    double A_n = accum.area_sum;
-
-                    // Tangential stiffness: fixed material value (An-independent) so the
-                    // Cundall spring force -kt*ds does not step when facets enter/leave overlap.
-                    double kt = (Ep * Rp) / (2.0 * (1.0 + nu_p));
-
-                    // Hertz contact model: drive the normal force by the continuous penetration
-                    // depth (deepest vertex -> wall), NOT by the clipped contact area A_n.
-                    // A_n is a step function of the particle pose; Fn ∝ An^(4/3) injects energy
-                    // every time a facet enters/leaves the overlap (energy analysis showed total
-                    // energy rising 0.83->1.90 under higher mu, i.e. the step-driven force feeds a
-                    // rotation->An-jump->injection positive feedback). penetration_max is Lipschitz-
-                    // continuous in the motion, so Fn = k_h * pen^(3/2) is smooth and the elastic
-                    // potential U = (2/5) k_h pen^(5/2) is conserved exactly (dU/dt = Fn*vn).
-                    double pen = std::max(accum.penetration_max, 0.0);
-                    double Estar = Ep / (2.0 * (1.0 - nu_p * nu_p));
-                    double k_h = (4.0 / 3.0) * Estar * std::sqrt(Rp);            // Hertz coefficient (material+geom, const)
-                    double kn_eff = 1.5 * k_h * std::sqrt(std::max(pen, 1e-12)); // tangent stiffness (continuous in pen)
-
-                    double m_eff = p.mass;
-                    double e = p.restitution;
-                    e = std::min(0.9999, std::max(1e-6, e));
-                    double loge = std::log(e);
-                    double cn = 2.0 * loge * std::sqrt(kn_eff * m_eff) / std::sqrt(loge * loge + 3.141592653589793 * 3.141592653589793);
-                    double ct = cfg.tangential_damping * std::sqrt(kt * m_eff);
-                    cn = std::abs(cn);
-                    ct = std::abs(ct);
-
-                    double fn_elastic = (pen > 0.0) ? (k_h * pen * std::sqrt(pen)) : 0.0;
-                    double fn_damping = (vn < 0.0) ? (-cn * vn) : 0.0;
-                    double fn = fn_elastic + fn_damping;
-                    if (fn < 0.0) fn = 0.0;
-                    Vec3 fn_vec = contact_normal * fn;
-
-                    // Wall history key (kept for tangential-disp map cleanup).
-                    const double history_quant = 1e4;
-                    WallHistoryKey wall_pair_key;
-                    wall_pair_key.particle_idx = patch_key.particle_idx;
-                    wall_pair_key.wall_idx = patch_key.wall_idx;
-                    wall_pair_key.nx = patch_key.nx;
-                    wall_pair_key.ny = patch_key.ny;
-                    wall_pair_key.nz = patch_key.nz;
-                    wall_pair_key.d = patch_key.d;
-                    wall_pair_key.cx = static_cast<int>(std::llround(contact_point.x * history_quant));
-                    wall_pair_key.cy = static_cast<int>(std::llround(contact_point.y * history_quant));
-                    wall_pair_key.cz = static_cast<int>(std::llround(contact_point.z * history_quant));
-
-                    // Distributed tangential friction over the penetrating-vertex contact
-                    // region. A single contact point cannot dissipate spin about the contact
-                    // normal (yaw): for omega = (0,0,w) and r = (0,0,-h), the point velocity
-                    // v_t = omega x r = 0, so point friction does no work and yaw never
-                    // decays (observed: wz frozen at 0.34 rad/s while wx,wy decay to ~0).
-                    // A real contact patch spans multiple vertices whose individual
-                    // velocities omega x r_v differ; summing their friction torques
-                    // -ct * sum(r_v x v_t_v) damps the spin while the net force cancels.
-                    // Weights are penetration depths (sum = cp_wsum), Coulomb-clamped per
-                    // vertex against that vertex's share of the normal force.
-                    Vec3 ft_total{0.0, 0.0, 0.0};
-                    Vec3 torque_ft{0.0, 0.0, 0.0};
-                    double mu = std::min(p.mu, wall.mu);
+                    if (n_cross == 0) continue;
+                    double m_eff_v = p.mass / static_cast<double>(n_cross);
+                    double ct_v = cfg.tangential_damping * std::sqrt(kt_w * m_eff_v);
+                    bool any_force = false;
                     for (const auto& v : pmesh.vertices) {
                         Vec3 wv = quat_rotate(p.tf.rot, v) + p.tf.pos;
-                        double s = dot(wp_n, wv - wp_p0);
-                        double delta = std::max(0.0, -s);
-                        if (delta <= 1e-12) continue;
-                        double w_v = delta / cp_wsum;
+                        double s = dot(g.n, wv) + g.d;
+                        if (s > -1e-12) continue;
+                        Vec3 p_proj = wv - g.n * s;
+                        bool inside = false;
+                        for (const auto& fp : g.footprints) {
+                            if (point_in_tri(p_proj, fp, g.n)) { inside = true; break; }
+                        }
+                        if (!inside) continue;
+                        double d_v = -s;
                         Vec3 r_v = wv - p.tf.pos;
                         Vec3 v_v = p.vel + cross(p.omega, r_v);
-                        double vn_v = dot(v_v, contact_normal);
-                        Vec3 vt_v = v_v - contact_normal * vn_v;
-                        Vec3 ft_v = vt_v * (-ct * w_v);
+                        double vn_v = dot(v_v, g.n);  // <0 = penetrating deeper
+                        double kn_eff_v = 1.5 * k_hw * std::sqrt(std::max(d_v, 1e-12));
+                        double cn_v = std::abs(2.0 * loge_w * std::sqrt(kn_eff_v * m_eff_v) /
+                            std::sqrt(loge_w * loge_w + pi2));
+                        double fn_v = k_hw * d_v * std::sqrt(d_v);
+                        if (vn_v < 0.0) fn_v += -cn_v * vn_v;
+                        if (fn_v < 0.0) fn_v = 0.0;
+                        Vec3 vt_v = v_v - g.n * vn_v;
+                        Vec3 ft_v = vt_v * (-ct_v);
                         double ftv_norm = norm(ft_v);
-                        double ftv_max = mu * fn * w_v;
+                        double ftv_max = mu_w * fn_v;
                         if (ftv_norm > ftv_max && ftv_norm > 1e-14) {
                             ft_v = ft_v * (ftv_max / ftv_norm);
                         }
-                        ft_total = ft_total + ft_v;
-                        torque_ft = torque_ft + cross(r_v, ft_v);
+                        Vec3 f_v = g.n * fn_v + ft_v;
+                        forces[i] += f_v;
+                        torques[i] += cross(r_v, f_v);
+                        any_force = true;
                     }
-
-                    // Normal force acts at the (continuous) weighted contact point;
-                    // tangential torques are already accumulated per vertex, so only the
-                    // normal share of the contact-point torque is taken here.
-                    Vec3 f = fn_vec + ft_total;
-                    forces[i] += f;
-                    torques[i] += cross(rP, fn_vec) + torque_ft;
-
-                    active_wall_pairs.insert(wall_pair_key);
-                    contact_counts[i] += 1;
-                    contacts++;
-
-                    if (cfg.contact_debug && contacts < 3) {
-                        std::cout << "  wall_contact: particle=" << i << " wall=" << w
-                                  << " patch_tris=" << accum.tri_count
-                                  << " section_loops=" << accum.section_loop_count
-                                  << " area=" << A_n
-                                  << " penetration=" << accum.penetration_max
-                                  << " xc=" << contact_point.x << "," << contact_point.y << "," << contact_point.z
-                                  << " n=" << contact_normal.x << "," << contact_normal.y << "," << contact_normal.z
-                                  << " F=" << f.x << "," << f.y << "," << f.z
-                                  << "\n";
+                    if (any_force) {
+                        contact_counts[i] += 1;
+                        contacts++;
+                        if (cfg.contact_debug && contacts < 3) {
+                            std::cout << "  wall_contact: particle=" << i << " wall=" << w
+                                      << " n_cross=" << n_cross
+                                      << " F=" << forces[i].x << "," << forces[i].y << "," << forces[i].z
+                                      << "\n";
+                        }
                     }
                 }
             }
@@ -2377,37 +2045,6 @@ int main(int argc, char** argv) {
 
         for (int i = 0; i < static_cast<int>(particles.size()); ++i) {
             integrate_particle(particles[i], forces[i], torques[i], cfg.gravity, cfg.dt);
-        }
-
-        for (auto it = tangential_disp.begin(); it != tangential_disp.end(); ) {
-            if (active_pairs.find(it->first) == active_pairs.end()) {
-                it = tangential_disp.erase(it);
-            } else {
-                ++it;
-            }
-        }
-        // Keep the kinematic penetration across short detection gaps (the
-        // intersection loop can intermittently vanish while the meshes are
-        // still overlapping); decay it slowly so stale state dies out.
-        for (auto it = pair_normal_pen.begin(); it != pair_normal_pen.end(); ) {
-            if (active_pairs.find(it->first) == active_pairs.end()) {
-                it->second *= 0.995;
-                if (it->second < 1e-9) {
-                    pair_locked_normal.erase(it->first);
-                    it = pair_normal_pen.erase(it);
-                    continue;
-                }
-            }
-            ++it;
-        }
-
-        // Clean up inactive wall contact tangential displacements
-        for (auto it = wall_tangential_disp.begin(); it != wall_tangential_disp.end(); ) {
-            if (active_wall_pairs.find(it->first) == active_wall_pairs.end()) {
-                it = wall_tangential_disp.erase(it);
-            } else {
-                ++it;
-            }
         }
 
         if (step % cfg.output_interval == 0) {

@@ -172,4 +172,90 @@ Vec3 tri_normal(const Triangle& tri) {
     return normalize(cross(e1, e2));
 }
 
+bool point_inside_mesh(const std::vector<Triangle>& tris, const Vec3& p) {
+    // Ray parity: shoot +x and count surface crossings. A watertight mesh
+    // gives odd = inside. Degenerate hits (ray ~parallel to a triangle) are
+    // counted conservatively; the STLs here are not adversarial.
+    int crossings = 0;
+    for (const auto& tri : tris) {
+        const Vec3& a = tri[0];
+        const Vec3& b = tri[1];
+        const Vec3& c = tri[2];
+        // Bounding-box shortcut on y/z before the full test.
+        double ymin = std::min({a.y, b.y, c.y});
+        double ymax = std::max({a.y, b.y, c.y});
+        double zmin = std::min({a.z, b.z, c.z});
+        double zmax = std::max({a.z, b.z, c.z});
+        if (p.y < ymin || p.y > ymax || p.z < zmin || p.z > zmax) continue;
+        // Solve p + t*(1,0,0) = a + u*(b-a) + v*(c-a) for the y,z rows:
+        //   e1.y*u + e2.y*v = d.y ;  e1.z*u + e2.z*v = d.z   (d = p - a)
+        Vec3 e1 = b - a;
+        Vec3 e2 = c - a;
+        double det = e1.y * e2.z - e1.z * e2.y;
+        if (std::abs(det) < 1e-14) continue;  // ray parallel to triangle plane
+        Vec3 d = p - a;
+        double u = (d.y * e2.z - d.z * e2.y) / det;
+        double v = (e1.y * d.z - e1.z * d.y) / det;
+        if (u < -1e-12 || v < -1e-12 || u + v > 1.0 + 1e-12) continue;
+        // Intersection x coordinate: x = a.x + u*e1.x + v*e2.x; need t = x - p.x > 0.
+        double xhit = a.x + u * e1.x + v * e2.x;
+        if (xhit > p.x) crossings++;
+    }
+    return (crossings % 2) == 1;
+}
+
+double point_mesh_distance(const std::vector<Triangle>& tris, const Vec3& p,
+                           Vec3& out_closest_point, Vec3& out_closest_normal) {
+    double best = std::numeric_limits<double>::max();
+    Vec3 best_q{0.0, 0.0, 0.0};
+    Vec3 best_n{0.0, 0.0, 0.0};
+    for (const auto& tri : tris) {
+        // Closest point on triangle (Ericson, Real-Time Collision Detection 5.1.5).
+        Vec3 ab = tri[1] - tri[0];
+        Vec3 ac = tri[2] - tri[0];
+        Vec3 ap = p - tri[0];
+        double d1 = dot(ab, ap);
+        double d2 = dot(ac, ap);
+        Vec3 q;
+        if (d1 <= 0.0 && d2 <= 0.0) {
+            q = tri[0];                                        // vertex A region
+        } else {
+            Vec3 bp = p - tri[1];
+            double d3 = dot(ab, bp);
+            double d4 = dot(ac, bp);
+            if (d3 >= 0.0 && d4 <= d3) {
+                q = tri[1];                                    // vertex B region
+            } else {
+                Vec3 cp = p - tri[2];
+                double d5 = dot(ab, cp);
+                double d6 = dot(ac, cp);
+                if (d6 >= 0.0 && d5 <= d6) {
+                    q = tri[2];                                // vertex C region
+                } else if (d1 * d4 - d3 * d2 <= 0.0 && d1 >= 0.0 && d3 <= 0.0) {
+                    q = tri[0] + ab * (d1 / (d1 - d3));        // edge AB
+                } else if (d5 * d2 - d6 * d1 <= 0.0 && d6 >= 0.0 && d5 <= d3) {
+                    q = tri[2] + ac * ((d6 - d5) / (d3 - d5)); // edge AC
+                } else {
+                    double va = d3 * d6 - d5 * d4;
+                    double vb = d5 * d2 - d1 * d6;
+                    double vc = d1 * d4 - d3 * d2;
+                    double denom = 1.0 / (va + vb + vc);
+                    double v = vb * denom;
+                    double w = vc * denom;
+                    q = tri[0] + ab * v + ac * w;              // face region
+                }
+            }
+        }
+        double dist2 = norm2(p - q);
+        if (dist2 < best) {
+            best = dist2;
+            best_q = q;
+            best_n = tri_normal(tri);
+        }
+    }
+    out_closest_point = best_q;
+    out_closest_normal = best_n;
+    return (best == std::numeric_limits<double>::max()) ? 0.0 : std::sqrt(best);
+}
+
 }  // namespace zdem
