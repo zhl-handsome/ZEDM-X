@@ -2,18 +2,24 @@
 // Task 4 scope: parse config -> host build -> device upload -> main loop
 // (clear_forces -> [contact kernels in Tasks 5/7] -> integrate) with
 // periodic VTK output through the shared host writer.
+// Task 6: spatial-hash broad phase between wall contact and integrate
+// (candidate pair list for Task 7) + --dump-pairs debug output.
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <iomanip>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <cuda_runtime.h>
 
 #include "gpu/cuda_check.hpp"
 #include "gpu/dem_state.cuh"
+#include "gpu/kernels/broadphase.cuh"
 #include "gpu/kernels/integrate.cuh"
 #include "gpu/kernels/wall_contact.cuh"
 #include "gpu/real.hpp"
@@ -29,7 +35,8 @@ __host__ inline const char* precision_name() {
 }
 
 void usage() {
-    std::printf("Usage: zdem_gpu --config path.txt [--check-sums]\n");
+    std::printf(
+        "Usage: zdem_gpu --config path.txt [--check-sums] [--dump-pairs N]\n");
 }
 
 // Per-output-interval snapshot: download the full frame, refresh the host
@@ -64,12 +71,15 @@ void output_vtk(const GpuSim& sim, const SimConfig& cfg, int step) {
 int main(int argc, char** argv) {
     std::string config_path;
     bool check_sums = false;
+    int dump_pairs_steps = 0;  // --dump-pairs N: print pair list for steps [0,N)
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--config" && i + 1 < argc) {
             config_path = argv[++i];
         } else if (arg == "--check-sums") {
             check_sums = true;
+        } else if (arg == "--dump-pairs" && i + 1 < argc) {
+            dump_pairs_steps = std::atoi(argv[++i]);
         } else if (arg == "--help") {
             usage();
             return 0;
@@ -123,6 +133,18 @@ int main(int argc, char** argv) {
     std::filesystem::create_directories(cfg.output_dir);
     const int n = sim.P.n;
     const int blocks = (n + kThreads - 1) / kThreads;
+    // Broad phase workspace: one-time alloc (persistent buffers, CUB temp
+    // sized once). Grid parameters came from upload: cell = 2*max(radius),
+    // origin = min corner of the upload positions.
+    alloc_broadphase(sim);
+    if (n > 0) {
+        std::printf("broadphase: n=%d cell=%.6g origin=(%.6g %.6g %.6g) cap=%d\n",
+                    n, static_cast<double>(sim.bp_cell),
+                    static_cast<double>(sim.bp_origin[0]),
+                    static_cast<double>(sim.bp_origin[1]),
+                    static_cast<double>(sim.bp_origin[2]), sim.BP.capacity);
+    }
+    bool pairs_overflow_warned = false;
     std::printf("simulating: n=%d steps=%d dt=%g output_interval=%d\n",
                 n, cfg.steps, cfg.dt, cfg.output_interval);
 
@@ -148,6 +170,36 @@ int main(int argc, char** argv) {
                     n, sim.W.n_groups);
                 CUDA_CHECK(cudaGetLastError());
             }
+            // Spatial-hash broad phase (Task 6): candidate pair list for the
+            // Task 7 particle-particle kernel. Detection only (no forces),
+            // but placed in its final slot: after wall contact, before
+            // integrate. Dump (if requested) runs BEFORE integrate, so the
+            // printed "pairs step=k" list reflects the state after k steps
+            // of integration = the state captured in VTK frame k-1 (frame j
+            // is written after step j's integrate); step 0 equals the
+            // initial/upload positions (there is no frame -1).
+            run_broadphase(sim);
+            CUDA_CHECK(cudaGetLastError());
+            if (dump_pairs_steps > 0 && step < dump_pairs_steps) {
+                BroadPhaseResult bp;
+                readback_pairs(sim, bp);
+                std::vector<std::pair<int, int>> prs;
+                prs.reserve(bp.stored);
+                for (int k = 0; k < bp.stored; ++k) {
+                    prs.emplace_back(bp.pairs[2 * k], bp.pairs[2 * k + 1]);
+                }
+                std::sort(prs.begin(), prs.end());
+                std::printf("pairs step=%d:", step);
+                for (const auto& pr : prs) std::printf(" %d-%d", pr.first, pr.second);
+                std::printf("\n");
+                if (bp.overflow && !pairs_overflow_warned) {
+                    std::fprintf(stderr,
+                                 "WARNING: broadphase pair capacity %d exceeded "
+                                 "(total %d), stored list clamped\n",
+                                 sim.BP.capacity, bp.n_pairs);
+                    pairs_overflow_warned = true;
+                }
+            }
             integrate_kernel<<<blocks, kThreads>>>(
                 sim.P.pos, sim.P.vel, sim.P.omega, sim.P.quat, sim.P.L,
                 sim.P.force, sim.P.torque, sim.P.inv_mass, sim.P.inertia_body_inv,
@@ -163,7 +215,10 @@ int main(int argc, char** argv) {
             double step_ms = std::chrono::duration<double, std::milli>(
                                  std::chrono::steady_clock::now() - step_t0)
                                  .count();
-            std::printf("step=%d contacts=%d step_ms=%.1f\n", step, contacts, step_ms);
+            // pairs= : this step's candidate count (broadphase result still
+            // live in BP.d_offsets[n]; additive log field).
+            std::printf("step=%d contacts=%d step_ms=%.1f pairs=%d\n",
+                        step, contacts, step_ms, peek_pair_count(sim));
         }
     }
     CUDA_CHECK(cudaDeviceSynchronize());

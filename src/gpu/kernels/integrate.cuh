@@ -44,6 +44,13 @@ __device__ inline real r_fabs(real x) {
     else return fabs(x);
 }
 
+// floor is not precision-sensitive (grid cell indexing in Task 6 broadphase
+// needs correct floor toward -infinity for negative cell coords).
+__device__ inline real r_floor(real x) {
+    if constexpr (sizeof(real) == 4) return floorf(x);
+    else return floor(x);
+}
+
 // --------------------------------------------------------------------------
 // quaternion helpers (same conventions as src/core/quat.hpp)
 // --------------------------------------------------------------------------

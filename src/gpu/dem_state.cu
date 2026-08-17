@@ -327,6 +327,31 @@ void GpuSim::upload(const SimConfig& cfg) {
     W.d_fp_start = upload_array(st_fp_start.data(), st_fp_start.size());
     W.d_mu = upload_array(st_gmu.data(), st_gmu.size());
 
+    // ================= broad phase grid: cell size + origin (Task 6) ========
+    // Cell edge = 2*max(radius): bounding spheres of any candidate pair
+    // (dist < ri+rj <= 2*rmax = cell) then lie in cells whose per-axis index
+    // difference is at most 1, so the 27-neighborhood scan in broadphase.cuh
+    // is exhaustive. Origin = min corner over positions, frozen at upload;
+    // falling particles make z cell coords negative, handled by the +2^20
+    // hash offset. Buffers are allocated once by alloc_broadphase() in
+    // dem_gpu.cu (CUB stays out of this translation unit).
+    {
+        double max_radius = 0.0;
+        Vec3 mn{0.0, 0.0, 0.0};
+        bool first = true;
+        for (const Particle& p : particles) {
+            max_radius = p.radius > max_radius ? p.radius : max_radius;
+            if (first || p.tf.pos.x < mn.x) mn.x = p.tf.pos.x;
+            if (first || p.tf.pos.y < mn.y) mn.y = p.tf.pos.y;
+            if (first || p.tf.pos.z < mn.z) mn.z = p.tf.pos.z;
+            first = false;
+        }
+        bp_cell = static_cast<real>(2.0 * max_radius);
+        bp_origin[0] = static_cast<real>(mn.x);
+        bp_origin[1] = static_cast<real>(mn.y);
+        bp_origin[2] = static_cast<real>(mn.z);
+    }
+
     // ================= device upload: particles (SoA) ========================
     const int n = static_cast<int>(particles.size());
     P.n = n;
@@ -435,6 +460,15 @@ void GpuSim::free_all() {
     free_buf(P.contacts);
     P.contacts = nullptr;
     P.n = 0;
+    // Broad phase workspace (allocated by alloc_broadphase in dem_gpu.cu).
+    free_buf(BP.d_keys_in); free_buf(BP.d_keys_sorted);
+    free_buf(BP.d_idx_in); free_buf(BP.d_idx_sorted);
+    free_buf(BP.d_counts); free_buf(BP.d_offsets); free_buf(BP.d_pairs);
+    free_buf(BP.d_overflow); free_buf(BP.d_temp);
+    BP.temp_bytes = 0;
+    BP.capacity = 0;
+    bp_cell = 0;
+    bp_origin[0] = 0; bp_origin[1] = 0; bp_origin[2] = 0;
     free_buf(d_gravity);
     d_gravity = nullptr;
     host_meshes.clear();

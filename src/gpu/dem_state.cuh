@@ -48,11 +48,37 @@ struct DeviceParticles {       // SoA state
     int n = 0;
 };
 
+// Spatial-hash broad phase workspace (GPU port Task 6). Persistent buffers
+// allocated ONCE after upload by alloc_broadphase() (gpu/kernels/broadphase.cuh;
+// kept out of dem_state.cu so CUB is only pulled into dem_gpu.cu) and freed by
+// GpuSim::free_all(). No per-step cudaMalloc: CUB temp storage is sized once
+// with the standard two-call (nullptr -> bytes) pattern.
+struct BroadPhaseWorkspace {
+    unsigned long long* d_keys_in = nullptr;     // [n] unsorted cell ids (compute_cell_ids output)
+    unsigned long long* d_keys_sorted = nullptr; // [n] radix-sorted cell ids
+    int* d_idx_in = nullptr;                     // [n] identity 0..n-1 (filled once at alloc)
+    int* d_idx_sorted = nullptr;                 // [n] particle index sorted by cell id
+    int* d_counts = nullptr;                     // [n+1] per-particle candidate count; counts[n] pinned 0
+    int* d_offsets = nullptr;                    // [n+1] exclusive scan of counts; offsets[n] = total pairs
+    int* d_pairs = nullptr;                      // [2*capacity] compact pair list (i,j) rows
+    int* d_overflow = nullptr;                   // [1] sticky flag: candidate count exceeded capacity
+    void* d_temp = nullptr;                      // CUB temp storage (max of sort/scan need)
+    std::size_t temp_bytes = 0;
+    int capacity = 0;                            // pair slots = 64*n (worst-case cap, see broadphase.cuh)
+};
+
 class GpuSim {
 public:
     DeviceParticles P; DeviceMeshes M; DeviceWalls W;
     real dt = 0; real gravity[3] = {0, 0, 0}; real tangential_damping = 0;
     real* d_gravity = nullptr;          // [3] device copy of gravity
+    // Broad phase grid (Task 6): cell size = 2*max(radius) over particles and
+    // grid origin = min corner over all particle positions, both fixed at
+    // upload. Positions move (free fall -> z below origin), so cell coords
+    // can go negative; the hash offsets them by +2^20 (see broadphase.cuh).
+    BroadPhaseWorkspace BP;
+    real bp_origin[3] = {0, 0, 0};      // min corner of positions at upload
+    real bp_cell = 0;                   // cell edge length = 2*max(radius)
     // Host registry copies kept from upload() for periodic VTK output: the
     // mesh registry (body frame; write_vtk_particles rotates to world with
     // the per-particle quaternion) and the initial Particle array (static
