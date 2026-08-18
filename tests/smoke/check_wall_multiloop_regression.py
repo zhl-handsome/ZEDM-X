@@ -25,9 +25,16 @@ def main() -> int:
         print(completed.stdout)
         raise SystemExit(f"wall_multiloop_regression failed with exit code {completed.returncode}")
 
-    if "section_loops=2" not in completed.stdout:
+    # v8 unified per-vertex contact (5c9595e) replaced the per-loop section
+    # telemetry with one wall_contact debug line: multiple contained vertices
+    # (n_cross >= 2) collapsing into a single force contact.
+    match = re.search(r"wall_contact: particle=\d+ wall=\d+ n_cross=(\d+)", completed.stdout)
+    if not match:
         print(completed.stdout)
-        raise SystemExit("expected wall debug output to report section_loops=2")
+        raise SystemExit("expected wall contact debug output with n_cross count")
+    if int(match.group(1)) < 2:
+        print(completed.stdout)
+        raise SystemExit("expected multiple contained vertices in the wall contact")
 
     match = re.search(r"step=0 contacts=(\d+)", completed.stdout)
     if not match:
