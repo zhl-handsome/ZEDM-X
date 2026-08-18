@@ -154,7 +154,7 @@ int main(int argc, char** argv) {
                                     cfg.tangential_damping) > 0) {
                     forces[li] += f_i; torques[li] += t_i;
                     cc[li]++;
-                    total_contacts++;
+                    if (gids[li] < ghost.gids[gj]) total_contacts++;   // count each cross-rank pair once (mirror CPU i<j)
                 }
             }
         }
@@ -182,8 +182,9 @@ int main(int argc, char** argv) {
         // ---- output: same condition, frame set and log fields as the CPU ----
         if (step % cfg.output_interval == 0) {
             gather_write_frame(d, cfg, sim, local, gids, cc, forces, torques, step);
+            int glob_contacts = reduce_add(d, total_contacts);
             if (d.rank == 0) {
-                std::printf("step=%d contacts=%d\n", step, reduce_add(d, total_contacts));
+                std::printf("step=%d contacts=%d\n", step, glob_contacts);
                 std::fflush(stdout);
             }
         }
