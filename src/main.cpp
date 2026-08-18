@@ -21,20 +21,14 @@
 #include "core/vec3.hpp"
 #include "geometry/mesh.hpp"
 #include "geometry/mesh_build.hpp"
-#include "geometry/stl_io.hpp"
 #include "host/config_io.hpp"
+#include "host/sim_build.hpp"
 #include "host/vtk_io.hpp"
+#include "physics/integrate.hpp"
+#include "physics/pp_contact.hpp"
+#include "physics/wall_contact.hpp"
 
 using namespace zdem;
-
-struct Wall {
-    Mesh mesh;
-    Transform tf;
-    double mu = 0.5;
-    double restitution = 0.5;
-    std::vector<Vec3> tri_normals;
-};
-
 
 static bool plane_from_tri(const std::array<Vec3, 3>& tri, Vec3& n, double& d) {
     n = cross(tri[1] - tri[0], tri[2] - tri[0]);
@@ -1001,57 +995,6 @@ static bool epa_penetration(const Mesh& a, const Transform& ta,
     return false;
 }
 
-static Mat3 inertia_world(const Particle& p) {
-    Mat3 R = quat_to_mat3(p.tf.rot);
-    Mat3 Rt = mat3_transpose(R);
-    return mat3_mul(mat3_mul(R, p.inertia_body), Rt);
-}
-
-
-static Mat3 inertia_world_inv(const Particle& p) {
-    Mat3 R = quat_to_mat3(p.tf.rot);
-    Mat3 Rt = mat3_transpose(R);
-    return mat3_mul(mat3_mul(R, p.inertia_body_inv), Rt);
-}
-
-// Exact exponential rotation increment for a world-frame angular velocity:
-// dq = {cos(th/2), w_hat*sin(th/2)}, q' = dq (x) q. Unlike the linearized
-// q += 0.5*qdot*dt this preserves the quaternion norm exactly per step.
-static Quat quat_step_world(const Quat& q, const Vec3& w, double dt) {
-    double wmag = std::sqrt(w.x * w.x + w.y * w.y + w.z * w.z);
-    double th = wmag * dt;
-    Quat dq;
-    if (th < 1e-300) {
-        dq.w = 1.0; dq.x = 0.0; dq.y = 0.0; dq.z = 0.0;
-    } else {
-        double s = std::sin(0.5 * th) / wmag;
-        dq.w = std::cos(0.5 * th);
-        dq.x = w.x * s; dq.y = w.y * s; dq.z = w.z * s;
-    }
-    return quat_mul(dq, q);
-}
-
-static void integrate_particle(Particle& p, const Vec3& force, const Vec3& torque, const Vec3& gravity, double dt) {
-    Vec3 acc = force * p.inv_mass + gravity;
-    p.vel += acc * dt;
-    p.tf.pos += p.vel * dt;
-
-    p.L += torque * dt;
-
-    // Midpoint attitude integration with exact exponential rotation steps.
-    // The old explicit form (omega from the PRE-rotation inertia, quaternion
-    // advanced linearly) injects rotational energy for an asymmetric body:
-    // a torque-free spinner at 400 rad/s grew to 2875 rad/s (isolated test).
-    // Here the half-step attitude is used to re-evaluate omega before the
-    // full step, and each rotation increment is a norm-preserving exponential.
-    Quat q0 = p.tf.rot;
-    Vec3 w0 = mat3_mul_vec3(inertia_world_inv(p), p.L);
-    p.tf.rot = quat_step_world(q0, w0, 0.5 * dt);
-    Vec3 wh = mat3_mul_vec3(inertia_world_inv(p), p.L);
-    p.tf.rot = quat_step_world(q0, wh, dt);
-    p.omega = mat3_mul_vec3(inertia_world_inv(p), p.L);
-}
-
 static bool parse_args(int argc, char** argv, std::string& config_path) {
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -1112,146 +1055,18 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::unordered_map<std::string, std::vector<std::array<Vec3, 3>>> tri_cache;
-    std::unordered_map<std::string, int> mesh_cache;
-    std::vector<Mesh> meshes;
-
-    auto load_mesh_for = [&](const std::string& path, double scale) -> int {
-        std::string key = path + "|" + std::to_string(scale);
-        auto it_cache = mesh_cache.find(key);
-        if (it_cache != mesh_cache.end()) {
-            return it_cache->second;
-        }
-
-        auto it = tri_cache.find(path);
-        if (it == tri_cache.end()) {
-            std::vector<std::array<Vec3, 3>> tris;
-            if (!load_stl(path, tris)) {
-                return -1;
-            }
-            tri_cache[path] = tris;
-            it = tri_cache.find(path);
-        }
-        std::vector<std::array<Vec3, 3>> tris = it->second;
-        for (auto& tri : tris) {
-            tri[0] *= scale;
-            tri[1] *= scale;
-            tri[2] *= scale;
-        }
-        Mesh m = build_mesh(tris, cfg.center_mesh);
-        meshes.push_back(m);
-        int idx = static_cast<int>(meshes.size() - 1);
-        mesh_cache[key] = idx;
-        return idx;
-    };
-
-    std::vector<ParticleInit> inits;
-    if (!cfg.particle_inits.empty()) {
-        inits = cfg.particle_inits;
-    } else {
-        inits.resize(cfg.n);
-        for (int i = 0; i < cfg.n; ++i) {
-            inits[i].stl_path = cfg.stl_path;
-            inits[i].pos = Vec3{cfg.spacing * i, 0.0, 0.0};
-            inits[i].vel = (i == 0) ? cfg.v0 : (i == 1 ? cfg.v1 : Vec3{0.0, 0.0, 0.0});
-            inits[i].rot = Quat{};
-            inits[i].omega = Vec3{0.0, 0.0, 0.0};
-            inits[i].scale = 1.0;
-            inits[i].density = 1.0;
-            inits[i].young = 1e7;
-            inits[i].poisson = 0.25;
-            inits[i].mu = 0.5;
-            inits[i].restitution = 0.5;
-        }
+    // Particle/wall/mesh-registry construction lives in zdem_core
+    // (host/sim_build.cpp) so the CPU and MPI drivers share one build path.
+    SimBuild sim;
+    std::string build_err;
+    if (!build_sim(cfg, sim, build_err)) {
+        std::cerr << build_err << "\n";
+        return 1;
     }
-
-    std::vector<Particle> particles(inits.size());
-    for (std::size_t i = 0; i < inits.size(); ++i) {
-        const auto& init = inits[i];
-        std::string stl_path = init.stl_path.empty() ? cfg.stl_path : init.stl_path;
-        if (stl_path.empty()) {
-            std::cerr << "Missing stl for particle " << i << "\n";
-            return 1;
-        }
-        double scale = init.scale > 0.0 ? init.scale : 1.0;
-        int mesh_index = load_mesh_for(stl_path, scale);
-        if (mesh_index < 0) {
-            std::cerr << "Failed to load STL: " << stl_path << "\n";
-            return 1;
-        }
-        const Mesh& mesh = meshes[mesh_index];
-        if (mesh.vertices.empty()) {
-            std::cerr << "Mesh has no vertices.\n";
-            return 1;
-        }
-        Particle p;
-        p.tf.pos = init.pos;
-        p.tf.rot = init.rot;
-        p.vel = init.vel;
-        p.omega = init.omega;
-        if (mesh.volume > 0.0) {
-            double density = init.density > 0.0 ? init.density : 1.0;
-            p.mass = density * mesh.volume;
-            p.inv_mass = 1.0 / p.mass;
-            p.inertia_body = mat3_scale(mesh.inertia_unit, density);
-            p.inertia_body_inv = mat3_inverse(p.inertia_body);
-        } else {
-            double density = init.density > 0.0 ? init.density : 1.0;
-            p.mass = density;
-            p.inv_mass = 1.0 / p.mass;
-            double I = 0.4 * p.mass * mesh.radius * mesh.radius;
-            Mat3 Ibody = mat3_identity();
-            Ibody.m[0][0] = I;
-            Ibody.m[1][1] = I;
-            Ibody.m[2][2] = I;
-            p.inertia_body = Ibody;
-            p.inertia_body_inv = mat3_inverse(Ibody);
-        }
-        p.radius = mesh.radius;
-        p.equiv_radius = mesh.volume > 0.0 ? std::cbrt(3.0 * mesh.volume / (4.0 * 3.141592653589793)) : mesh.radius;
-        p.young = init.young;
-        p.poisson = init.poisson;
-        p.mu = init.mu;
-        p.restitution = init.restitution;
-        p.mesh_index = mesh_index;
-        p.L = mat3_mul_vec3(inertia_world(p), p.omega);
-        particles[i] = p;
-    }
-
-    // Initialize walls
-    std::vector<Wall> walls;
-    for (const auto& wi : cfg.wall_inits) {
-        if (wi.stl_path.empty()) {
-            std::cerr << "Wall missing stl path.\n";
-            continue;
-        }
-        std::vector<std::array<Vec3, 3>> wall_tris;
-        if (!load_stl(wi.stl_path, wall_tris)) {
-            std::cerr << "Failed to load wall STL: " << wi.stl_path << "\n";
-            continue;
-        }
-        double scale = wi.scale > 0.0 ? wi.scale : 1.0;
-        for (auto& tri : wall_tris) {
-            tri[0] = tri[0] * scale;
-            tri[1] = tri[1] * scale;
-            tri[2] = tri[2] * scale;
-        }
-        Wall wall;
-        wall.mesh = build_mesh(wall_tris, cfg.center_mesh);
-        wall.tf.pos = wi.pos;
-        wall.tf.rot = wi.rot;
-        wall.mu = wi.mu;
-        wall.restitution = wi.restitution;
-
-        // Precompute wall triangle normals in world space
-        std::vector<std::array<Vec3, 3>> world_tris = transform_tris(wall.mesh, wall.tf);
-        wall.tri_normals.resize(world_tris.size());
-        for (std::size_t t = 0; t < world_tris.size(); ++t) {
-            wall.tri_normals[t] = tri_normal(world_tris[t]);
-        }
-        walls.push_back(wall);
-        std::cout << "Loaded wall: " << wi.stl_path << " (tris=" << wall.mesh.tris.size() << ")\n";
-    }
+    std::vector<Mesh>& meshes = sim.meshes;
+    std::vector<ParticleInit>& inits = sim.inits;
+    std::vector<Particle>& particles = sim.particles;
+    std::vector<Wall>& walls = sim.walls;
 
     std::vector<Vec3> forces(particles.size());
     std::vector<Vec3> torques(particles.size());
@@ -1371,124 +1186,20 @@ int main(int argc, char** argv) {
                 }
                 t_tri += std::chrono::steady_clock::now() - t0;
 
-                // ============== Containment scan ==============
-                // Vertices that have crossed INTO the other mesh: the earliest
-                // contact signal for concave shapes. The segment pipeline stays
-                // blind while a vertex slides through the other body's bay -- the
-                // first loop used to appear with the vertex already 30 mm deep,
-                // and loading the full Hertz force on that overlap teleported
-                // (2/5)*kh*pen^2.5 ~ 57 J of potential energy into a 0.1 J impact.
-                // Each hit records (vertex, closest surface point, depth): that
-                // pair of material points is one penalty contact element.
-                std::vector<Vec3> incA, incB;          // contained vertices
-                std::vector<Vec3> incA_cp, incB_cp;    // their closest points on the other surface
-                std::vector<double> incA_d, incB_d;    // depths |vertex - closest|
-                {
-                    Vec3 bmn = trisB[0][0], bmx = trisB[0][0];
-                    for (const auto& t : trisB) {
-                        for (const auto& c : t) {
-                            bmn.x = std::min(bmn.x, c.x); bmn.y = std::min(bmn.y, c.y); bmn.z = std::min(bmn.z, c.z);
-                            bmx.x = std::max(bmx.x, c.x); bmx.y = std::max(bmx.y, c.y); bmx.z = std::max(bmx.z, c.z);
-                        }
-                    }
-                    for (const auto& v : meshA.vertices) {
-                        Vec3 wv = quat_rotate(pa.tf.rot, v) + pa.tf.pos;
-                        if (wv.x < bmn.x || wv.x > bmx.x || wv.y < bmn.y || wv.y > bmx.y || wv.z < bmn.z || wv.z > bmx.z) continue;
-                        if (!point_inside_mesh(trisB, wv)) continue;
-                        Vec3 cp, nf; double d = point_mesh_distance(trisB, wv, cp, nf);
-                        if (d <= 1e-12) continue;
-                        incA.push_back(wv); incA_cp.push_back(cp); incA_d.push_back(d);
-                    }
-                    Vec3 amn = trisA[0][0], amx = trisA[0][0];
-                    for (const auto& t : trisA) {
-                        for (const auto& c : t) {
-                            amn.x = std::min(amn.x, c.x); amn.y = std::min(amn.y, c.y); amn.z = std::min(amn.z, c.z);
-                            amx.x = std::max(amx.x, c.x); amx.y = std::max(amx.y, c.y); amx.z = std::max(amx.z, c.z);
-                        }
-                    }
-                    for (const auto& v : meshB.vertices) {
-                        Vec3 wv = quat_rotate(pb.tf.rot, v) + pb.tf.pos;
-                        if (wv.x < amn.x || wv.x > amx.x || wv.y < amn.y || wv.y > amx.y || wv.z < amn.z || wv.z > amx.z) continue;
-                        if (!point_inside_mesh(trisA, wv)) continue;
-                        Vec3 cp, nf; double d = point_mesh_distance(trisA, wv, cp, nf);
-                        if (d <= 1e-12) continue;
-                        incB.push_back(wv); incB_cp.push_back(cp); incB_d.push_back(d);
-                    }
-                }
-
-                if (!incA.empty() || !incB.empty()) {
-                    // ============== Per-vertex penalty contact ==============
-                    // Each contained vertex and its closest point on the other
-                    // surface form ONE contact element: the spring length is the
-                    // depth d, and the force acts on exactly the two material
-                    // points whose separation defines d. The spring's rate of
-                    // change therefore equals the relative velocity of the very
-                    // points the force acts on -- dU/dt = F.v holds by
-                    // construction. Single-point forms (loop contact point,
-                    // weighted average, deepest vertex) all mismatched the
-                    // driving quantity's time derivative against the force's
-                    // application point under spin and injected up to kJ.
-                    // The push direction is -(vertex - closest)/d: winding-free
-                    // (this STL's face windings are NOT consistent, 19/102 faces
-                    // point inward), always from the surface point away from the
-                    // interior point, i.e. the separation direction.
-                    double Rp1 = std::max(pa.equiv_radius, 1e-12);
-                    double Rp2 = std::max(pb.equiv_radius, 1e-12);
-                    double E1r = std::max(pa.young, 1e-12);
-                    double E2r = std::max(pb.young, 1e-12);
-                    double Estar_r = 1.0 / ((1.0 - pa.poisson * pa.poisson) / E1r + (1.0 - pb.poisson * pb.poisson) / E2r);
-                    double Rstar_r = (Rp1 * Rp2) / std::max(Rp1 + Rp2, 1e-12);
-                    double k_hr = (4.0 / 3.0) * Estar_r * std::sqrt(Rstar_r);
-                    double kt_r = 0.5 * ((E1r * Rp1) / (2.0 * (1.0 + pa.poisson)) + (E2r * Rp2) / (2.0 * (1.0 + pb.poisson)));
-                    double m_eff_r = 1.0 / (pa.inv_mass + pb.inv_mass);
-                    int n_inc = static_cast<int>(incA.size() + incB.size());
-                    double m_eff_v = m_eff_r / std::max(n_inc, 1);  // each vertex carries its mass share
-                    double e_r = std::min(pa.restitution, pb.restitution);
-                    e_r = std::min(0.9999, std::max(1e-6, e_r));
-                    double loge_r = std::log(e_r);
-                    double pi2 = 3.141592653589793 * 3.141592653589793;
-                    double ct_v = cfg.tangential_damping * std::sqrt(kt_r * m_eff_v);
-                    double mu_r = std::min(pa.mu, pb.mu);
-                    auto apply_penalty = [&](const Vec3& wv, const Vec3& cp, double d,
-                                             const Particle& p_own, const Particle& p_other,
-                                             int i_own, int i_other) {
-                        Vec3 u = (wv - cp) * (1.0 / std::max(d, 1e-15));  // surface -> interior
-                        Vec3 n_push = u * -1.0;                            // separation direction
-                        Vec3 v_own = p_own.vel + cross(p_own.omega, wv - p_own.tf.pos);
-                        Vec3 v_oth = p_other.vel + cross(p_other.omega, cp - p_other.tf.pos);
-                        Vec3 vrel = v_own - v_oth;
-                        double vn = dot(vrel, n_push);  // <0 = penetrating deeper
-                        double kn_eff_v = 1.5 * k_hr * std::sqrt(std::max(d, 1e-12));
-                        double cn_v = std::abs(2.0 * loge_r * std::sqrt(kn_eff_v * m_eff_v) /
-                            std::sqrt(loge_r * loge_r + pi2));
-                        double fn_v = k_hr * d * std::sqrt(d);
-                        if (vn < 0.0) fn_v += -cn_v * vn;
-                        if (fn_v < 0.0) fn_v = 0.0;
-                        Vec3 fn_vec = n_push * fn_v;
-                        forces[i_own] += fn_vec;
-                        forces[i_other] -= fn_vec;
-                        torques[i_own] += cross(wv - p_own.tf.pos, fn_vec);
-                        torques[i_other] += cross(cp - p_other.tf.pos, fn_vec * -1.0);
-                        // Tangential friction at the same pair of points
-                        Vec3 vt = vrel - n_push * vn;
-                        Vec3 ft_v = vt * (-ct_v);
-                        double ftv_norm = norm(ft_v);
-                        double ftv_max = mu_r * fn_v;
-                        if (ftv_norm > ftv_max && ftv_norm > 1e-14) {
-                            ft_v = ft_v * (ftv_max / ftv_norm);
-                        }
-                        forces[i_own] += ft_v;
-                        forces[i_other] -= ft_v;
-                        torques[i_own] += cross(wv - p_own.tf.pos, ft_v);
-                        torques[i_other] += cross(cp - p_other.tf.pos, ft_v * -1.0);
-                    };
-                    for (std::size_t k = 0; k < incA.size(); ++k) {
-                        apply_penalty(incA[k], incA_cp[k], incA_d[k], pa, pb, i, j);
-                    }
-                    for (std::size_t k = 0; k < incB.size(); ++k) {
-                        apply_penalty(incB[k], incB_cp[k], incB_d[k], pb, pa, j, i);
-                    }
-                    contact_counts[i] += 1;
+                // ============== Containment + per-vertex penalty (v8) ==============
+                // Moved verbatim into zdem_core (physics/pp_contact.cpp) so the
+                // CPU and MPI drivers share one contact kernel. Block-sum
+                // accumulation: f_i/f_j preserve the original per-vertex order
+                // (all incA first, then all incB, normal then tangential per
+                // vertex) inside the pair -- bit-parity vs the pre-extraction
+                // binary is gated by scratch/mpi_v0_* and scratch/pp_v0_*.
+                Vec3 f_i, t_i, f_j, t_j;
+                int n_inc = pp_contact_pair(pa, pb, meshA, meshB,
+                                            f_i, t_i, f_j, t_j, cfg.tangential_damping);
+                if (n_inc > 0) {
+                    forces[i] += f_i; torques[i] += t_i;      // Block sums: f_i/f_j keep the original per-vertex
+                    forces[j] += f_j; torques[j] += t_j;      // order inside the pair, but the final add is whole-block
+                    contact_counts[i] += 1;                   // -- bit-parity gated (see brief Step 5 fallback note).
                     contact_counts[j] += 1;
                     contacts++;
                     // Containment fully covers this pair; skip the loop pipeline.
@@ -1538,155 +1249,17 @@ int main(int argc, char** argv) {
         }
 
         // ============== Particle-Wall Contact Detection ==============
+        // Moved verbatim into zdem_core (physics/wall_contact.cpp); forces[i]/
+        // torques[i] are passed by reference so the per-vertex accumulation
+        // order is exactly the pre-extraction one (no block-sum regrouping).
         for (int i = 0; i < static_cast<int>(particles.size()); ++i) {
             Particle& p = particles[i];
             const Mesh& pmesh = meshes[p.mesh_index];
-
-            for (int w = 0; w < static_cast<int>(walls.size()); ++w) {
-                const Wall& wall = walls[w];
-
-                // Broad phase: check if particle bounding sphere overlaps with wall bounding sphere
-                Vec3 dpos = p.tf.pos - wall.tf.pos;
-                double dist2 = dot(dpos, dpos);
-                double rsum = p.radius + wall.mesh.radius;
-                if (dist2 > rsum * rsum) {
-                    continue;
-                }
-
-                std::vector<std::array<Vec3, 3>> wall_tris = transform_tris(wall.mesh, wall.tf);
-
-                double tol = pmesh.mean_edge > 0.0 ? (pmesh.mean_edge * 0.1) : (pmesh.bbox_diag * 1e-2);
-                if (tol <= 0.0) tol = 1e-6;
-
-                // ============== Wall contact: per-vertex penalty (v8) ==============
-                // Same contact element as particle-particle: every vertex that
-                // crossed a wall plane is one penalty spring acting exactly at
-                // that vertex. Coplanar wall triangles passing the AABB test
-                // are grouped so a vertex in the shared footprint is charged
-                // once (a split plane wall is TWO coplanar triangles -- without
-                // grouping every contact force would be doubled). The old
-                // clip-loop pipeline drove the force by the deepest vertex but
-                // applied it at a depth-weighted average point -- different
-                // material points, the spin-mismatch injection fixed in the
-                // pair contact; after the integrator stopped dissipating
-                // numerically it left the e=0.3 wall case oscillating forever.
-                struct WallPlaneGroup {
-                    Vec3 n; double d;
-                    std::vector<std::array<Vec3, 3>> footprints;
-                };
-                std::vector<WallPlaneGroup> groups;
-                for (std::size_t t = 0; t < wall_tris.size(); ++t) {
-                    const auto& wtri = wall_tris[t];
-                    Vec3 wmn{std::min({wtri[0].x, wtri[1].x, wtri[2].x}),
-                             std::min({wtri[0].y, wtri[1].y, wtri[2].y}),
-                             std::min({wtri[0].z, wtri[1].z, wtri[2].z})};
-                    Vec3 wmx{std::max({wtri[0].x, wtri[1].x, wtri[2].x}),
-                             std::max({wtri[0].y, wtri[1].y, wtri[2].y}),
-                             std::max({wtri[0].z, wtri[1].z, wtri[2].z})};
-                    Vec3 pmn = p.tf.pos - Vec3{p.radius, p.radius, p.radius};
-                    Vec3 pmx = p.tf.pos + Vec3{p.radius, p.radius, p.radius};
-                    if (pmx.x < wmn.x || pmn.x > wmx.x ||
-                        pmx.y < wmn.y || pmn.y > wmx.y ||
-                        pmx.z < wmn.z || pmn.z > wmx.z) {
-                        continue;
-                    }
-                    Vec3 pn = tri_normal(wtri);
-                    if (dot(pn, p.tf.pos - wtri[0]) < 0.0) {
-                        pn = pn * -1.0;  // push toward the particle side
-                    }
-                    double pd = -dot(pn, wtri[0]);
-                    const double pq = 1e6;
-                    bool merged = false;
-                    for (auto& g : groups) {
-                        if (std::llround(g.n.x * pq) == std::llround(pn.x * pq) &&
-                            std::llround(g.n.y * pq) == std::llround(pn.y * pq) &&
-                            std::llround(g.n.z * pq) == std::llround(pn.z * pq) &&
-                            std::llround(g.d * pq) == std::llround(pd * pq)) {
-                            g.footprints.push_back(wtri);
-                            merged = true;
-                            break;
-                        }
-                    }
-                    if (!merged) {
-                        WallPlaneGroup g;
-                        g.n = pn; g.d = pd;
-                        g.footprints.push_back(wtri);
-                        groups.push_back(g);
-                    }
-                }
-
-                double Rp = std::max(p.equiv_radius, 1e-12);
-                double Ep = std::max(p.young, 1e-12);
-                double nu_p = p.poisson;
-                double Estar = Ep / (2.0 * (1.0 - nu_p * nu_p));
-                double k_hw = (4.0 / 3.0) * Estar * std::sqrt(Rp);
-                double kt_w = (Ep * Rp) / (2.0 * (1.0 + nu_p));
-                double e_w = std::min(0.9999, std::max(1e-6, p.restitution));
-                double loge_w = std::log(e_w);
-                double pi2 = 3.141592653589793 * 3.141592653589793;
-                double mu_w = std::min(p.mu, wall.mu);
-
-                for (const auto& g : groups) {
-                    // Count crossings first so the damping uses each vertex share
-                    // of the particle mass.
-                    int n_cross = 0;
-                    for (const auto& v : pmesh.vertices) {
-                        Vec3 wv = quat_rotate(p.tf.rot, v) + p.tf.pos;
-                        double s = dot(g.n, wv) + g.d;
-                        if (s > -1e-12) continue;
-                        Vec3 p_proj = wv - g.n * s;  // drop onto the wall plane
-                        for (const auto& fp : g.footprints) {
-                            if (point_in_tri(p_proj, fp, g.n)) { ++n_cross; break; }
-                        }
-                    }
-                    if (n_cross == 0) continue;
-                    double m_eff_v = p.mass / static_cast<double>(n_cross);
-                    double ct_v = cfg.tangential_damping * std::sqrt(kt_w * m_eff_v);
-                    bool any_force = false;
-                    for (const auto& v : pmesh.vertices) {
-                        Vec3 wv = quat_rotate(p.tf.rot, v) + p.tf.pos;
-                        double s = dot(g.n, wv) + g.d;
-                        if (s > -1e-12) continue;
-                        Vec3 p_proj = wv - g.n * s;
-                        bool inside = false;
-                        for (const auto& fp : g.footprints) {
-                            if (point_in_tri(p_proj, fp, g.n)) { inside = true; break; }
-                        }
-                        if (!inside) continue;
-                        double d_v = -s;
-                        Vec3 r_v = wv - p.tf.pos;
-                        Vec3 v_v = p.vel + cross(p.omega, r_v);
-                        double vn_v = dot(v_v, g.n);  // <0 = penetrating deeper
-                        double kn_eff_v = 1.5 * k_hw * std::sqrt(std::max(d_v, 1e-12));
-                        double cn_v = std::abs(2.0 * loge_w * std::sqrt(kn_eff_v * m_eff_v) /
-                            std::sqrt(loge_w * loge_w + pi2));
-                        double fn_v = k_hw * d_v * std::sqrt(d_v);
-                        if (vn_v < 0.0) fn_v += -cn_v * vn_v;
-                        if (fn_v < 0.0) fn_v = 0.0;
-                        Vec3 vt_v = v_v - g.n * vn_v;
-                        Vec3 ft_v = vt_v * (-ct_v);
-                        double ftv_norm = norm(ft_v);
-                        double ftv_max = mu_w * fn_v;
-                        if (ftv_norm > ftv_max && ftv_norm > 1e-14) {
-                            ft_v = ft_v * (ftv_max / ftv_norm);
-                        }
-                        Vec3 f_v = g.n * fn_v + ft_v;
-                        forces[i] += f_v;
-                        torques[i] += cross(r_v, f_v);
-                        any_force = true;
-                    }
-                    if (any_force) {
-                        contact_counts[i] += 1;
-                        contacts++;
-                        if (cfg.contact_debug && contacts < 3) {
-                            std::cout << "  wall_contact: particle=" << i << " wall=" << w
-                                      << " n_cross=" << n_cross
-                                      << " F=" << forces[i].x << "," << forces[i].y << "," << forces[i].z
-                                      << "\n";
-                        }
-                    }
-                }
-            }
+            int n_wall_contacts = wall_contact_particle(p, pmesh, walls, cfg.tangential_damping,
+                                                        forces[i], torques[i],
+                                                        cfg.contact_debug, i, contacts);
+            contact_counts[i] += n_wall_contacts;
+            contacts += n_wall_contacts;
         }
 
         for (int i = 0; i < static_cast<int>(particles.size()); ++i) {
