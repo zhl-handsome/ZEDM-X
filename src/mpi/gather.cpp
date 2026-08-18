@@ -103,4 +103,5 @@ void log_rank_n(const Decomp& d, const std::vector<int>& local_sizes_hint) {
         }
     }
     std::printf("\n");
+    std::fflush(stdout);   // survive MPI_Abort right after an output step
 }

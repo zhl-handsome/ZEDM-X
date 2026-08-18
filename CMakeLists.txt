@@ -108,6 +108,7 @@ add_executable(zdem_mpi
     src/mpi/decomp.cpp
     src/mpi/gather.cpp
     src/mpi/ghost.cpp
+    src/mpi/migrate.cpp
 )
 # MPI::MPI_CXX (not MPI::MPI_C): this project enables only CXX+CUDA, so
 # FindMPI does not create the C flavored imported target.

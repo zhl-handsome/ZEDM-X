@@ -4,56 +4,7 @@
 #include <cstdio>
 #include <vector>
 
-namespace {
-
-// One ghost particle on the wire. POD, shipped as raw MPI_BYTES -- the same
-// trick gather.cpp uses for FrameSnapshot.
-struct PackedPart {
-    Particle p;
-    int gid;
-};
-
-inline double axis_val(const Vec3& pos, int axis) {
-    return axis == 0 ? pos.x : (axis == 1 ? pos.y : pos.z);
-}
-
-// Swap a variable-length PackedPart list with one face-neighbor pair:
-// first a 1-int count Sendrecv, then the fixed-size records. Two-phase
-// counting avoids MPI_Probe entirely and is portable across MPI stacks.
-//
-// dir=+1 sends our to_hi window to the +axis neighbor and receives its
-// to_hi window back (particles just below our sub_lo face); dir=-1 mirrors
-// that across the lo face. MPI_PROC_NULL at non-periodic box edges turns
-// each Sendrecv into a local no-op (recv count stays 0).
-//
-// Tags: every message moving in the +axis direction is sent by a dir=+1
-// call and received by a dir=+1 call on the far side (Cart_shift's
-// source/dest are symmetric across the shared face), so a tag derived from
-// (axis, dir) matches on both ends. Count and data get separate tags.
-std::vector<PackedPart> exchange_face(MPI_Comm cart, int axis, int dir,
-                                      const std::vector<PackedPart>& sendbuf) {
-    int src = MPI_PROC_NULL, dst = MPI_PROC_NULL;
-    MPI_Cart_shift(cart, axis, dir, &src, &dst);
-
-    const int tag_count = 4 * axis + (dir > 0 ? 0 : 2);
-    const int tag_data = tag_count + 1;
-
-    const int n_send = static_cast<int>(sendbuf.size());
-    int n_recv = 0;
-    MPI_Sendrecv(&n_send, 1, MPI_INT, dst, tag_count,
-                 &n_recv, 1, MPI_INT, src, tag_count, cart, MPI_STATUS_IGNORE);
-
-    std::vector<PackedPart> recvbuf(n_recv);
-    const int unit = static_cast<int>(sizeof(PackedPart));
-    MPI_Sendrecv(n_send > 0 ? sendbuf.data() : nullptr,
-                 n_send * unit, MPI_BYTE, dst, tag_data,
-                 n_recv > 0 ? recvbuf.data() : nullptr,
-                 n_recv * unit, MPI_BYTE, src, tag_data,
-                 cart, MPI_STATUS_IGNORE);
-    return recvbuf;
-}
-
-}  // namespace
+#include "mpi/comm_util.hpp"
 
 void exchange_ghosts(const Decomp& d, const std::vector<Particle>& local,
                      const std::vector<int>& gids, GhostLayer& out) {
@@ -86,8 +37,11 @@ void exchange_ghosts(const Decomp& d, const std::vector<Particle>& local,
             if (v > d.sub_hi[axis] - d.ghost_depth) to_hi.push_back(w);
             if (v < d.sub_lo[axis] + d.ghost_depth) to_lo.push_back(w);
         }
-        std::vector<PackedPart> got_lo = exchange_face(d.cart, axis, +1, to_hi);
-        std::vector<PackedPart> got_hi = exchange_face(d.cart, axis, -1, to_lo);
+        // Ghost tags 4*axis+{0..3}; migrate.cpp uses a disjoint range.
+        std::vector<PackedPart> got_lo =
+            sendrecv_particles(d.cart, axis, +1, 4 * axis + 0, to_hi);
+        std::vector<PackedPart> got_hi =
+            sendrecv_particles(d.cart, axis, -1, 4 * axis + 2, to_lo);
         W.insert(W.end(), got_lo.begin(), got_lo.end());
         W.insert(W.end(), got_hi.begin(), got_hi.end());
     }

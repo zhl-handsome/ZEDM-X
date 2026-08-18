@@ -3,7 +3,9 @@
 // whole-block adds as the CPU driver), ghost pp pairs (own half only,
 // Newton off; the halo is rebuilt by the chained three-axis exchange after
 // every step), wall contact for local particles against the replicated
-// wall set, local integration, then gather-based VTK output on rank 0.
+// wall set, local integration, gather-based VTK output on rank 0, then
+// centroid migration (particles that left their brick change rank) and the
+// halo rebuild so the next step sees fresh ownership.
 // Per-step semantics (wall contact_count accumulation, per-step contacts
 // counter, output condition/frame set/log line) are copied from
 // src/main.cpp.
@@ -19,6 +21,7 @@
 #include "mpi/decomp.hpp"
 #include "mpi/gather.hpp"
 #include "mpi/ghost.hpp"
+#include "mpi/migrate.hpp"
 #include "physics/integrate.hpp"
 #include "physics/pp_contact.hpp"
 #include "physics/wall_contact.hpp"
@@ -75,16 +78,11 @@ int main(int argc, char** argv) {
     }
 
     // Conservation check: every particle is owned by exactly one rank.
-    long long loc = (long long)local.size();
-    long long tot = 0;
-    MPI_Allreduce(&loc, &tot, 1, MPI_LONG_LONG, MPI_SUM, d.cart);
-    if (tot != (long long)sim.particles.size()) {
-        if (wrank == 0) {
-            std::fprintf(stderr, "initial distribution lost/duplicated particles: sum(nlocal)=%lld != N=%lld\n",
-                         tot, (long long)sim.particles.size());
-        }
-        MPI_Abort(d.cart, 1);
-    }
+    // This is also the standing invariant for migration: this phase never
+    // inserts or deletes particles, so the global N stays fixed for the
+    // whole run.
+    long long tot = assert_global_count(d, (long long)local.size(),
+                                        (long long)sim.particles.size());
 
     if (d.rank == 0) {
         std::printf("zdem_mpi: nprocs=%d dims=%dx%dx%d box=[%.3f %.3f]-[%.3f %.3f]-[%.3f %.3f] ghost=%.3f N=%lld\n",
@@ -188,10 +186,21 @@ int main(int argc, char** argv) {
                 std::printf("step=%d contacts=%d\n", step, glob_contacts);
                 std::fflush(stdout);
             }
+            // Per-output-step ownership distribution (design-spec load
+            // diagnostics): every rank contributes its size, rank 0 prints
+            // rank_n=a,b,c. Migration shows up here as counts shifting
+            // between ranks after a boundary crossing.
+            std::vector<int> nlocal_hint(1, (int)local.size());
+            log_rank_n(d, nlocal_hint);
         }
 
-        // ---- migration (Task 6) hooks here, then rebuild the halo so the
-        // next step's force computation sees fresh ghost positions ----
+        // ---- migration + halo rebuild: particles whose centroid left its
+        // brick move to the owner rank, then the halo is rebuilt so the
+        // next step's force computation sees fresh ownership and ghost
+        // positions. Output already happened above (per the plan's Global
+        // Constraints: force/cc arrays are indexed by the pre-migration
+        // local order). ----
+        migrate_particles(d, local, gids);
         exchange_ghosts(d, local, gids, ghost);
     }
 
