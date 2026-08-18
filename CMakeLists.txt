@@ -90,6 +90,16 @@ if(Python3_Interpreter_FOUND)
                 --exe $<TARGET_FILE:zdem_gpu>
                 --root ${CMAKE_SOURCE_DIR}
     )
+    # MPI smoke: same scenario under mpiexec -n 2 (zdem_mpi is defined
+    # further below; the generator expression resolves at generate time).
+    # SKIPs (exit 0) when no mpiexec is on PATH.
+    add_test(
+        NAME mpi_smoke
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_SOURCE_DIR}/tests/smoke/check_mpi_smoke.py
+                --exe $<TARGET_FILE:zdem_mpi>
+                --root ${CMAKE_SOURCE_DIR}
+    )
 endif()
 
 find_package(MPI REQUIRED)   # only affects the target below; everything above builds as-is without MPI

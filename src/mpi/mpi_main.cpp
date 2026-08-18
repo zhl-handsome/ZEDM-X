@@ -1,11 +1,12 @@
 // src/mpi/mpi_main.cpp -- MPI DEM driver (v8, Newton off, static bricks).
 // Full time loop: local-local pp pairs (same i<j order and double-sided
 // whole-block adds as the CPU driver), ghost pp pairs (own half only,
-// Newton off; halo is empty until Task 5), wall contact for local particles
-// against the replicated wall set, local integration, then gather-based VTK
-// output on rank 0. Per-step semantics (wall contact_count accumulation,
-// per-step contacts counter, output condition/frame set/log line) are
-// copied from src/main.cpp.
+// Newton off; the halo is rebuilt by the chained three-axis exchange after
+// every step), wall contact for local particles against the replicated
+// wall set, local integration, then gather-based VTK output on rank 0.
+// Per-step semantics (wall contact_count accumulation, per-step contacts
+// counter, output condition/frame set/log line) are copied from
+// src/main.cpp.
 #include <cstdio>
 #include <filesystem>
 #include <string>
@@ -103,7 +104,7 @@ int main(int argc, char** argv) {
     }
 
     GhostLayer ghost;
-    exchange_ghosts(d, local, gids, ghost);   // n=1: empty; Task 5 fills this
+    exchange_ghosts(d, local, gids, ghost);   // step 0's halo (rebuilt at the end of every step)
 
     std::vector<Vec3> forces, torques;
     std::vector<int> cc;
@@ -189,7 +190,9 @@ int main(int argc, char** argv) {
             }
         }
 
-        // ---- migration (Task 6) and ghost rebuild (Task 5) hook here ----
+        // ---- migration (Task 6) hooks here, then rebuild the halo so the
+        // next step's force computation sees fresh ghost positions ----
+        exchange_ghosts(d, local, gids, ghost);
     }
 
     if (d.rank == 0) {
