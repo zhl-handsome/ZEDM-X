@@ -9,10 +9,11 @@
 **项目名称**: ZDEM-X  
 **核心功能**: 基于 Route-B 理论的多面体 DEM(离散元)接触模型,v8 统一 per-vertex 罚弹簧接触(wall 与粒子-粒子同一模型)
 
-**三实现架构**(同一 v8 物理模型):
+**四实现架构**(同一 v8 物理模型,共享 `zdem_core` 物理层):
 - `polyline.py`:Python 几何原型与算法验证(本文下半部分的 Python 风格指南适用于此)
 - `zdem_cpu`(C++):`src/main.cpp` + `src/host/` 共享库,高性能仿真与 **golden reference**
 - `zdem_gpu`(CUDA):`src/gpu/`,与 CPU 逐条对应;FP64 对照逐位一致,FP32 同判据达标,64 粒子 49× 加速
+- `zdem_mpi`(MPI C):`src/mpi/`,静态 brick 域分解 + Newton-off + ghost/迁移三轴链式交换;V0-V2 与 CPU parity 字节级一致,pile64×4 进程 n=4/n=1 加速 2.71×(见 `docs/superpowers/notes/2026-08-18-mpi-performance.md`)
 
 **技术特点**:
 - 任意凸/凹多面体颗粒接触计算(banana STL 有 19/102 面朝内,winding-free 处理)
@@ -47,7 +48,11 @@ build/Release/zdem_cpu --config config/example_sim.txt
 cmake -S . -B build -DZDEM_PRECISION=float && cmake --build build --config Release
 build/Release/zdem_gpu --config config/example_sim.txt
 
-# 测试(CTest,5 项烟雾/回归)
+# MPI 版(需要 MPI;无 MPI 环境时该 target 自动跳过,zdem_cpu/gpu 照常构建)
+cmake --build build --config Release
+mpiexec -n 2 build/Release/zdem_mpi --config config/example_sim.txt
+
+# 测试(CTest,7 项烟雾/回归,含 mpi_smoke;无 MPI 时 6 项)
 cd build && ctest -C Release --output-on-failure
 ```
 
