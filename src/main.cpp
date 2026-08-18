@@ -1277,7 +1277,6 @@ int main(int argc, char** argv) {
         for (int j = i + 1; j < static_cast<int>(particles.size()); ++j) {
                 Particle& pa = particles[i];
                 Particle& pb = particles[j];
-                long long pair_key = (static_cast<long long>(i) << 32) | static_cast<unsigned long long>(j);
                 Vec3 dpos = pb.tf.pos - pa.tf.pos;
                 double dist2 = dot(dpos, dpos);
                 double rsum = pa.radius + pb.radius;

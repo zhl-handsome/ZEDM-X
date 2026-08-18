@@ -147,6 +147,9 @@ __global__ void candidate_pairs_kernel(
                     const real ddz = pos[3 * j + 2] - zi;
                     const real d2 = ddx * ddx + ddy * ddy + ddz * ddz;
                     const real rsum = ri + radius[j];
+                    // Parity note: the CPU keeps dist2 == rsum^2 pairs (its
+                    // skip is `dist2 > rsum*rsum`), this is strict '<' --
+                    // a measure-zero difference in the candidate set.
                     if (d2 < rsum * rsum) {
                         if (pairs != nullptr) {  // write pass only
                             const int slot = offsets[i] + cnt;

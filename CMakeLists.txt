@@ -77,4 +77,13 @@ if(Python3_Interpreter_FOUND)
                 --exe $<TARGET_FILE:zdem_cpu>
                 --root ${CMAKE_SOURCE_DIR}
     )
+    # GPU smoke: run zdem_gpu on the same static-contact scenario, assert
+    # contacts >= 1 at step 0. SKIPs (exit 0) when no NVIDIA device exists.
+    add_test(
+        NAME gpu_smoke
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_SOURCE_DIR}/tests/smoke/check_gpu_smoke.py
+                --exe $<TARGET_FILE:zdem_gpu>
+                --root ${CMAKE_SOURCE_DIR}
+    )
 endif()

@@ -1,9 +1,7 @@
 // src/gpu/dem_gpu.cu -- GPU DEM driver (v8 per-vertex penalty contact).
-// Task 4 scope: parse config -> host build -> device upload -> main loop
-// (clear_forces -> [contact kernels in Tasks 5/7] -> integrate) with
-// periodic VTK output through the shared host writer.
-// Task 6: spatial-hash broad phase between wall contact and integrate
-// (candidate pair list for Task 7) + --dump-pairs debug output.
+// parse config -> host build -> device upload -> main loop through the
+// shared host writer. Per-step kernel order mirrors the CPU loop exactly
+// (clear -> broadphase -> pp_contact -> wall_contact -> integrate).
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -30,6 +28,11 @@
 namespace {
 
 constexpr int kThreads = 128;
+// pp_contact's shared staging is sized by kPPThreads and its entry guard
+// silently no-ops a launch with any other blockDim -- pin the two constants
+// together so a kThreads change breaks the build instead of the physics.
+static_assert(kThreads == kPPThreads,
+              "pp_contact shared staging assumes blockDim == kPPThreads");
 
 __host__ inline const char* precision_name() {
     return sizeof(real) == 8 ? "double" : "float";
@@ -99,6 +102,11 @@ int main(int argc, char** argv) {
     if (!parse_config_file(config_path, cfg)) {
         return 1;
     }
+    if (cfg.contact_debug) {
+        std::fprintf(stderr,
+                     "note: GPU build has no per-contact debug output; "
+                     "contact_debug=1 is ignored\n");
+    }
 
     std::printf("zdem_gpu (CUDA, precision=%s)\n", precision_name());
 
@@ -146,6 +154,7 @@ int main(int argc, char** argv) {
                     static_cast<double>(sim.bp_origin[2]), sim.BP.capacity);
     }
     bool pairs_overflow_warned = false;
+    bool pp_overflow_warned = false;
     std::printf("simulating: n=%d steps=%d dt=%g output_interval=%d\n",
                 n, cfg.steps, cfg.dt, cfg.output_interval);
 
@@ -155,27 +164,14 @@ int main(int argc, char** argv) {
             clear_forces_kernel<<<blocks, kThreads>>>(
                 sim.P.force, sim.P.torque, sim.P.contact_count, sim.P.contacts, n);
             CUDA_CHECK(cudaGetLastError());
-            // Wall contact: one block per (particle, wall-group). Same counter
-            // semantics as the CPU step log (wall groups with contact; the
-            // particle-particle kernel joins the same accumulator in Task 7).
-            if (sim.W.n_groups > 0) {
-                dim3 wc_grid(n, sim.W.n_groups);
-                wall_contact_kernel<<<wc_grid, kThreads>>>(
-                    sim.P.pos, sim.P.quat, sim.P.vel, sim.P.omega,
-                    sim.P.mass, sim.P.equiv_radius, sim.P.young,
-                    sim.P.poisson, sim.P.mu, sim.P.restitution,
-                    sim.P.mesh_index, sim.M.d_verts, sim.M.d_voffset,
-                    sim.W.d_gn, sim.W.d_gd, sim.W.d_fp, sim.W.d_fp_start,
-                    sim.W.d_mu, sim.tangential_damping,
-                    sim.P.force, sim.P.torque, sim.P.contact_count, sim.P.contacts,
-                    n, sim.W.n_groups);
-                CUDA_CHECK(cudaGetLastError());
-            }
             // Spatial-hash broad phase (Task 6): candidate pair list for the
-            // Task 7 particle-particle kernel. Detection only (no forces),
-            // but placed in its final slot: after wall contact, before
-            // integrate. Dump (if requested) runs BEFORE integrate, so the
-            // printed "pairs step=k" list reflects the state after k steps
+            // Task 7 particle-particle kernel. Detection only (no forces).
+            // Kernel order matches the CPU loop and the design spec exactly:
+            // clear -> broadphase -> pp_contact -> wall_contact -> integrate
+            // (CPU: pp pair loop -> wall loop -> integrate), so force[]
+            // accumulation order is the CPU's order for FP64 parity.
+            // Dump (if requested) runs BEFORE integrate, so the printed
+            // "pairs step=k" list reflects the state after k steps
             // of integration = the state captured in VTK frame k-1 (frame j
             // is written after step j's integrate); step 0 equals the
             // initial/upload positions (there is no frame -1).
@@ -235,6 +231,23 @@ int main(int argc, char** argv) {
                     CUDA_CHECK(cudaGetLastError());
                 }
             }
+            // Wall contact: one block per (particle, wall-group), AFTER the
+            // particle-particle kernel to match the CPU loop order (pp pair
+            // loop -> wall loop -> integrate). Same counter semantics as the
+            // CPU step log (wall groups with contact).
+            if (sim.W.n_groups > 0) {
+                dim3 wc_grid(n, sim.W.n_groups);
+                wall_contact_kernel<<<wc_grid, kThreads>>>(
+                    sim.P.pos, sim.P.quat, sim.P.vel, sim.P.omega,
+                    sim.P.mass, sim.P.equiv_radius, sim.P.young,
+                    sim.P.poisson, sim.P.mu, sim.P.restitution,
+                    sim.P.mesh_index, sim.M.d_verts, sim.M.d_voffset,
+                    sim.W.d_gn, sim.W.d_gd, sim.W.d_fp, sim.W.d_fp_start,
+                    sim.W.d_mu, sim.tangential_damping,
+                    sim.P.force, sim.P.torque, sim.P.contact_count, sim.P.contacts,
+                    n, sim.W.n_groups);
+                CUDA_CHECK(cudaGetLastError());
+            }
             integrate_kernel<<<blocks, kThreads>>>(
                 sim.P.pos, sim.P.vel, sim.P.omega, sim.P.quat, sim.P.L,
                 sim.P.force, sim.P.torque, sim.P.inv_mass, sim.P.inertia_body_inv,
@@ -242,18 +255,46 @@ int main(int argc, char** argv) {
             CUDA_CHECK(cudaGetLastError());
         }
         if (step % cfg.output_interval == 0) {
+            // step_ms covers the physics segment only (launches + device
+            // execution, via the sync below); the VTK download/write is
+            // reported separately as output_ms. This split mirrors the CPU
+            // log so the fields are comparable across executables.
             CUDA_CHECK(cudaDeviceSynchronize());
-            int contacts = 0;
-            CUDA_CHECK(cudaMemcpy(&contacts, sim.P.contacts, sizeof(int),
-                                  cudaMemcpyDeviceToHost));
-            output_vtk(sim, cfg, step);
             double step_ms = std::chrono::duration<double, std::milli>(
                                  std::chrono::steady_clock::now() - step_t0)
                                  .count();
+            int contacts = 0;
+            CUDA_CHECK(cudaMemcpy(&contacts, sim.P.contacts, sizeof(int),
+                                  cudaMemcpyDeviceToHost));
+            auto out_t0 = std::chrono::steady_clock::now();
+            output_vtk(sim, cfg, step);
+            double output_ms = std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - out_t0)
+                                   .count();
+            // Latched pp_contact overflow (a side with more contained
+            // vertices than the shared hit cap keeps only the deepest set --
+            // declared divergence). Warn once, then reset the latch.
+            int pp_ovf = 0;
+            CUDA_CHECK(cudaMemcpyFromSymbol(&pp_ovf, g_pp_hits_overflow,
+                                            sizeof(int)));
+            if (pp_ovf != 0) {
+                if (!pp_overflow_warned) {
+                    std::fprintf(stderr,
+                                 "WARNING: pp_contact hit cap exceeded; only "
+                                 "the deepest %d contained vertices per side "
+                                 "contribute forces\n",
+                                 kPPMaxHits);
+                    pp_overflow_warned = true;
+                }
+                int zero = 0;
+                CUDA_CHECK(cudaMemcpyToSymbol(g_pp_hits_overflow, &zero,
+                                              sizeof(int)));
+            }
             // pairs= : this step's candidate count (broadphase result still
             // live in BP.d_offsets[n]; additive log field).
-            std::printf("step=%d contacts=%d step_ms=%.1f pairs=%d\n",
-                        step, contacts, step_ms, peek_pair_count(sim));
+            std::printf("step=%d contacts=%d step_ms=%.1f output_ms=%.1f pairs=%d\n",
+                        step, contacts, step_ms, output_ms,
+                        peek_pair_count(sim));
         }
     }
     CUDA_CHECK(cudaDeviceSynchronize());

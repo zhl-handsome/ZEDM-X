@@ -46,6 +46,12 @@
 namespace {
 constexpr int kPPThreads = 128;  // threads per pair block
 constexpr int kPPMaxHits = 64;   // contained-vertex slots per side (banana: 53 verts)
+
+// Latched (set to 1, never cleared on device) when any side's contained-
+// vertex count exceeds kPPMaxHits and the eviction path runs. The host reads
+// it at output steps via cudaMemcpyFromSymbol, warns once and resets -- the
+// declared deepest-keep divergence then stops being silent.
+__device__ int g_pp_hits_overflow = 0;
 }  // namespace
 
 // Largest finite real (initial value for min/max reductions; CPU uses
@@ -219,6 +225,7 @@ __device__ inline void pp_store_hit(
         hd[slot] = d;
         return;
     }
+    g_pp_hits_overflow = 1;  // over cap: deepest-keep divergence engaged
     while (atomicExch(s_lock, 1) == 1) { /* spin */ }
     int shallow = 0;
     real dmin = hd[0];

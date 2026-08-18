@@ -7,15 +7,20 @@
 ## 项目概览
 
 **项目名称**: ZDEM-X  
-**核心功能**: 基于 Route-B 理论的多面体 DEM 接触模型 Python 实现  
-**主要文件**: `polyline.py` (839 行)  
-**依赖**: NumPy (Python 3.7+)
+**核心功能**: 基于 Route-B 理论的多面体 DEM(离散元)接触模型,v8 统一 per-vertex 罚弹簧接触(wall 与粒子-粒子同一模型)
+
+**三实现架构**(同一 v8 物理模型):
+- `polyline.py`:Python 几何原型与算法验证(本文下半部分的 Python 风格指南适用于此)
+- `zdem_cpu`(C++):`src/main.cpp` + `src/host/` 共享库,高性能仿真与 **golden reference**
+- `zdem_gpu`(CUDA):`src/gpu/`,与 CPU 逐条对应;FP64 对照逐位一致,FP32 同判据达标,64 粒子 49× 加速
 
 **技术特点**:
-- 任意凸/凹多面体颗粒接触计算
-- STL 网格输入/VTK 可视化输出
-- 能量守恒的接触力模型
-- 多接触区域自动识别
+- 任意凸/凹多面体颗粒接触计算(banana STL 有 19/102 面朝内,winding-free 处理)
+- STL 网格输入/VTK 可视化输出(CPU/GPU 逐字段一致)
+- 能量精确闭合的接触力模型(无跨步接触状态)
+- 空间哈希 broadphase(CPU O(N²) 对照;GPU CUB radix sort)
+
+日常开发规范、测试方法论、工作流程规则见 `CLAUDE.md`(权威,持续更新);GPU 设计与验收记录见 `docs/superpowers/specs|plans|notes/`。
 
 ---
 
@@ -31,7 +36,24 @@ D:/ProgramData/anaconda3/python.exe -m pip install -r requirements.txt
 D:/ProgramData/anaconda3/Scripts/activate.bat base
 ```
 
-### 运行主程序
+### C++ / CUDA 构建(CMake ≥ 3.18,MSVC + nvcc)
+
+```bash
+# CPU 版
+cmake -S . -B build && cmake --build build --config Release
+build/Release/zdem_cpu --config config/example_sim.txt
+
+# GPU 版(默认 FP32;FP64 对照构建 -DZDEM_PRECISION=double)
+cmake -S . -B build -DZDEM_PRECISION=float && cmake --build build --config Release
+build/Release/zdem_gpu --config config/example_sim.txt
+
+# 测试(CTest,5 项烟雾/回归)
+cd build && ctest -C Release --output-on-failure
+```
+
+config 格式 CPU/GPU 完全兼容;VTK 输出一致,`scratch/` 下分析脚本(analyze_vtk.py / pile_analyze.py / pp_analyze.py / gpu_compare.py)直接复用。
+
+### 运行 Python 原型
 
 ```bash
 # 基本用法
@@ -53,17 +75,15 @@ python polyline.py meshA.stl meshB.stl \
 
 ### 测试命令
 
-**当前状态**: 测试套件待添加 (见 README.md 开发计划)
-
 ```bash
-# 单元测试 (待实现)
-python -m pytest tests/
+# C++/CUDA 测试套件(CTest,在 build 目录)
+cd build && ctest -C Release --output-on-failure
 
-# 单个测试文件 (待实现)
-python -m pytest tests/test_geometry.py -v
+# 几何单元测试(C++,源 tests/)
+ctest -C Release -R geometry
 
-# 特定测试函数 (待实现)
-python -m pytest tests/test_geometry.py::test_snap_endpoints -v
+# GPU 对照工具(逐帧 VTK diff,FP64 验收用)
+D:/ProgramData/anaconda3/python.exe scratch/gpu_compare.py <dir_cpu> <dir_gpu> <n_particles>
 ```
 
 ### 代码检查
@@ -293,15 +313,14 @@ write_vtk_polydata_polylines(
 
 ### 性能优化指南
 
-**当前瓶颈** (README 开发计划):
-- 三角形-三角形相交: O(N²) 暴力检测
-- T-junction 切分: 迭代扫描
+**已落地**:
+- C++ 版(`zdem_cpu`)替代 Python 热点
+- GPU 版(`zdem_gpu`):64 粒子 49× 加速,交叉点 4–6 粒子(测量方法与规模表见 `docs/superpowers/notes/2026-08-18-gpu-performance.md`)
 
-**建议方向**:
-1. 空间加速 (BVH / Octree)
-2. Cython 重写热点函数
-3. C++ 扩展 (`pybind11`)
-4. GPU 加速 (CUDA)
+**后续方向**(GPU B 阶段,10⁵–10⁷ 粒子真实瓶颈出现后):
+1. 排序分桶 / shared memory 缓存网格(只动 kernel 内部、不动布局)
+2. kernel 分解计时(cudaEvent)定位瓶颈
+3. 多 mesh 类型与可迁移粒子
 
 ### 常见任务
 
@@ -347,5 +366,5 @@ python polyline.py ... --tol 1e-7
 
 ---
 
-**文档版本**: 1.0 (2026-02-10)  
+**文档版本**: 1.1 (2026-08-18,补充 C++/CUDA 实现与真实测试命令;Python 风格指南仍适用于 `polyline.py`)  
 **生成工具**: AI Agent (Sisyphus)

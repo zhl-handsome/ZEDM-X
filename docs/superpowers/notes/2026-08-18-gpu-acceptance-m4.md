@@ -8,7 +8,7 @@
 
 | 算例 | 精度 | 步数 | 判据 | 结果 |
 |----|----|----|----|----|
-| pile12 对照 | FP64 | 16 000(interval 100 → 160 帧)| 位置 < 1e-6 m,能量 < 1e-9(相对)| **PASS,max\|dpos\|=0,max\|dE\|=0**(逐位一致)|
+| pile12 对照 | FP64 | 16 000(interval 100 → 160 帧)| 位置 < 1e-6 m,能量 < 1e-9(相对)| **PASS,max\|dpos\|=0,max\|dE\|=0**(偏差低于工具分辨率 ~1e-7,见下)|
 | wall_v8 | FP32 | 300 000 | E 末段恒定,完全静止 | **PASS**,E 自 50k 步起恒定 0.072 J;tail30 \|v\|=1e-4,\|ω\|=0,z_std=0 |
 | pp_v8full | FP32 | 100 000 | 注入 ≤ 0.02 J,动量守恒,反弹 | **PASS**,碰后注入 +0.0054 J;Px/Py range = 0;vrel_x +1.000 → −0.024 |
 | pile6d_v8b | FP32 | 250 000 | ALL AT REST,E 恒定无回升 | **PASS**,E 9.971 → 0.681 单调降后恒定;6 粒子全部静止 |
@@ -20,7 +20,8 @@
 
 - config:`scratch/pile12_gpu64.txt`(16 000 步,dt=2e-5,interval=100),CPU 基线 `pile12_cpu64.txt`
 - 工具:`scratch/gpu_compare.py scratch/out_pile12_cpu64 scratch/out_pile12_gpu64 12`
-- 160 帧全部 `max|dpos| = 0.000e+00`、`dE = 0.000e+00`:GPU 与 CPU 在 FP64 下逐步逐位一致(12 粒子、~26 对接触链,含持续接触下的姿态演化)
+- 160 帧全部 `max|dpos| = 0.000e+00`、`dE = 0.000e+00`(12 粒子、~26 对接触链,含持续接触下的姿态演化)
+- **分辨率说明**(2026-08-18 review 修正):gpu_compare.py 对照的 COM/速度来自 VTK,而 VTK 以 float + 6 位有效数字写出(分辨率 ~1e-7),且 pp/wall 的 atomicAdd 累加序本身不保证 bit 级——"0.000e+00" 证明偏差低于 ~1e-7,满足 1e-6/1e-9 容差判据,但**不构成逐位一致的证明**;如需 bit 级结论须用全精度输出(如逐步 checksum)再对照
 - 远超计划要求的前 2 000 步覆盖(实际 16 000 步)
 
 ### FP32 物理指标(阶段 2,Release 构建)
