@@ -149,6 +149,12 @@ bool parse_config_file(const std::string& path, SimConfig& cfg) {
             iss >> cfg.v1.x >> cfg.v1.y >> cfg.v1.z;
         } else if (key == "tangential_damping") {
             iss >> cfg.tangential_damping;
+        } else if (key == "mpi_box") {
+            iss >> cfg.mpi_box[0] >> cfg.mpi_box[1] >> cfg.mpi_box[2]
+                >> cfg.mpi_box[3] >> cfg.mpi_box[4] >> cfg.mpi_box[5];
+            cfg.has_mpi_box = true;
+        } else if (key == "mpi_margin") {
+            iss >> cfg.mpi_margin;
         }
     }
     if (in_particle) {
