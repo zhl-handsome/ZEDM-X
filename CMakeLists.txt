@@ -96,6 +96,8 @@ find_package(MPI REQUIRED)   # only affects the target below; everything above b
 add_executable(zdem_mpi
     src/mpi/mpi_main.cpp
     src/mpi/decomp.cpp
+    src/mpi/gather.cpp
+    src/mpi/ghost.cpp
 )
 # MPI::MPI_CXX (not MPI::MPI_C): this project enables only CXX+CUDA, so
 # FindMPI does not create the C flavored imported target.
