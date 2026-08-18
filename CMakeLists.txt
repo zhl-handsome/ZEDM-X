@@ -91,3 +91,12 @@ if(Python3_Interpreter_FOUND)
                 --root ${CMAKE_SOURCE_DIR}
     )
 endif()
+
+find_package(MPI REQUIRED)   # only affects the target below; everything above builds as-is without MPI
+add_executable(zdem_mpi
+    src/mpi/mpi_main.cpp
+    src/mpi/decomp.cpp
+)
+# MPI::MPI_CXX (not MPI::MPI_C): this project enables only CXX+CUDA, so
+# FindMPI does not create the C flavored imported target.
+target_link_libraries(zdem_mpi PRIVATE zdem_core MPI::MPI_CXX)
