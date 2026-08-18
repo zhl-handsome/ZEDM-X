@@ -89,7 +89,7 @@ zdem_mpi(新):
 | V0 | `mpiexec -n 1` vs `zdem_cpu`,wall64/pile12 前 2k(FP64)| 位置 <1e-6,能量 <1e-9(容差;枚举序不同 → ulp 级,不逐位)|
 | V1 | n=2(x 二分)pile12 前 2k(跨域接触链)| 同上 |
 | V2 | 单粒子跨域飞行 + 对撞跨域 | 轨迹 parity;gid 唯一性断言过 |
-| V3 | pile64 FP32 × 4 进程 + 更大规模 | 全局 E 单调/恒定,无爆炸穿模,同单进程判据 |
+| V3 | pile64(double)× 4 进程 + 更大规模 | 全局 E 单调/恒定,无爆炸穿模,同单进程判据(MPI 版为 CPU 谱系纯 double,无 FP32 变体)|
 | 性能 | 本机 1/2/4 进程 step_ms | 如实记录(单机带宽,不外推集群)|
 
 工具:复用 `scratch/gpu_compare.py`(逐帧 VTK diff,输出格式一致故直接可用)。
