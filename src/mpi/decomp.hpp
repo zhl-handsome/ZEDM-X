@@ -28,4 +28,4 @@ struct Decomp {
 // (still violating at dims==1 -> fatal: box too small / too many ranks).
 Decomp make_decomp(const SimConfig& cfg, const SimBuild& sim);
 int owner_rank(const Decomp& d, const Vec3& pos);   // pos -> global rank (floor into brick; out-of-box clamping is detected by the caller)
-bool in_sub(const Decomp& d, const Vec3& pos);      // owned by this rank (left-closed right-open, same floor semantics as owner_rank)
+bool in_sub(const Decomp& d, const Vec3& pos);      // owned by this rank (left-closed right-open, same floor semantics as owner_rank); positions on/above the outer high boundary clamp into the last brick -- the caller-side out-of-box error catches true escapes
