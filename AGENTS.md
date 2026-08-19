@@ -319,8 +319,10 @@ write_vtk_polydata_polylines(
 ### 性能优化指南
 
 **已落地**:
-- C++ 版(`zdem_cpu`)替代 Python 热点
+- C++ 版(`zdem_cpu`)替代 Python 热点;Route-B 环路遥测默认关(`route_b_telemetry`,开=慢 ~9×)
+- 共享 spatial-hash broadphase(枚举序保持,VTK 字节级不变;收益 N≥10³)
 - GPU 版(`zdem_gpu`):64 粒子 49× 加速,交叉点 4–6 粒子(测量方法与规模表见 `docs/superpowers/notes/2026-08-18-gpu-performance.md`)
+- MPI 版(`zdem_mpi`):pile256 n=2 效率 99%(P 核放置);本机混合核计时伪影与协议见 `docs/superpowers/notes/2026-08-19-mpi-scaling.md`,优化批次记录见 `2026-08-19-cpu-perf-optimizations.md`
 
 **后续方向**(GPU B 阶段,10⁵–10⁷ 粒子真实瓶颈出现后):
 1. 排序分桶 / shared memory 缓存网格(只动 kernel 内部、不动布局)
