@@ -24,6 +24,7 @@
 #include "host/config_io.hpp"
 #include "host/sim_build.hpp"
 #include "host/vtk_io.hpp"
+#include "physics/broadphase.hpp"
 #include "physics/integrate.hpp"
 #include "physics/pp_contact.hpp"
 #include "physics/wall_contact.hpp"
@@ -1101,16 +1102,19 @@ int main(int argc, char** argv) {
             world_tris[p] = transform_tris(meshes[particles[p].mesh_index], particles[p].tf);
         }
 
-    for (int i = 0; i < static_cast<int>(particles.size()); ++i) {
-        for (int j = i + 1; j < static_cast<int>(particles.size()); ++j) {
+        // Candidate pairs from the shared spatial hash (physics/broadphase):
+        // replaces the former O(N^2) i<j bounding-sphere double loop.
+        // broadphase_pairs returns exactly the pairs that passed the old
+        // in-loop precheck (bit-identical distance test) in the same
+        // lexicographic (i, j) order, so the loop body below sees identical
+        // inputs in an identical sequence -- VTK output stays byte-level
+        // unchanged.
+        std::vector<std::pair<int, int>> pp_pairs;
+        broadphase_pairs(particles, static_cast<int>(particles.size()), pp_pairs);
+
+        for (const auto& [i, j] : pp_pairs) {
                 Particle& pa = particles[i];
                 Particle& pb = particles[j];
-                Vec3 dpos = pb.tf.pos - pa.tf.pos;
-                double dist2 = dot(dpos, dpos);
-                double rsum = pa.radius + pb.radius;
-                if (dist2 > rsum * rsum) {
-                    continue;
-                }
 
                 const Mesh& meshA = meshes[pa.mesh_index];
                 const Mesh& meshB = meshes[pb.mesh_index];
@@ -1277,7 +1281,6 @@ int main(int argc, char** argv) {
                     total_loops += loops_vids.size();
                 }
                 t_rebuild += std::chrono::steady_clock::now() - t0;
-            }
         }
 
         // ============== Particle-Wall Contact Detection ==============

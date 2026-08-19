@@ -23,6 +23,7 @@
 #include "mpi/gather.hpp"
 #include "mpi/ghost.hpp"
 #include "mpi/migrate.hpp"
+#include "physics/broadphase.hpp"
 #include "physics/integrate.hpp"
 #include "physics/pp_contact.hpp"
 #include "physics/wall_contact.hpp"
@@ -130,11 +131,29 @@ int main(int argc, char** argv) {
         }
 
         // ---- particle-particle (Newton off) ----
-        for (int li = 0; li < (int)local.size(); ++li) {
-            // Local pairs: same i<j order, bounding-sphere prefilter and
-            // double-sided whole-block adds as the CPU loop; at n=1 this
-            // covers every pair exactly like the CPU.
-            for (int lj = li + 1; lj < (int)local.size(); ++lj) {
+        // Broadphase: one shared spatial-hash call over the combined
+        // [local; ghost] array replaces the former O(N^2) local double loop
+        // plus full ghost scan. The sorted (i, j) pair list reproduces the
+        // old per-li nesting exactly: for each local i, the local partners
+        // (j < n_local, ascending, j > i) come first, then the ghosts
+        // (j >= n_local, ascending) -- lexicographic order on the combined
+        // array IS that order. Ghost-ghost pairs (first index >= n_local)
+        // are dropped inside broadphase_pairs; the drivers never computed
+        // them. The prechecks below are bit-identical no-op copies of the
+        // test already applied inside broadphase_pairs (kept conservative
+        // per the task brief).
+        std::vector<Particle> all;
+        all.reserve(local.size() + ghost.particles.size());
+        all.insert(all.end(), local.begin(), local.end());
+        all.insert(all.end(), ghost.particles.begin(), ghost.particles.end());
+        const int n_local = (int)local.size();
+        std::vector<std::pair<int, int>> pp_pairs;
+        broadphase_pairs(all, n_local, pp_pairs);
+        for (const auto& [li, lj] : pp_pairs) {
+            if (lj < n_local) {
+                // Local pair: same i<j order, bounding-sphere prefilter and
+                // double-sided whole-block adds as the CPU loop; at n=1 this
+                // covers every pair exactly like the CPU.
                 Vec3 dpos = local[lj].tf.pos - local[li].tf.pos;
                 double rsum = local[li].radius + local[lj].radius;
                 if (dot(dpos, dpos) > rsum * rsum) {
@@ -152,10 +171,10 @@ int main(int argc, char** argv) {
                     cc[li]++; cc[lj]++;
                     total_contacts++;
                 }
-            }
-            // Ghost pairs: this rank owns li, so keep only the own half
-            // (f_i/t_i); the ghost's owner adds the mirrored other half.
-            for (int gj = 0; gj < (int)ghost.particles.size(); ++gj) {
+            } else {
+                // Ghost pair: this rank owns li, so keep only the own half
+                // (f_i/t_i); the ghost's owner adds the mirrored other half.
+                const int gj = lj - n_local;
                 if (ghost.gids[gj] == gids[li]) continue;   // defensive; migration keeps gids unique
                 const Particle& g = ghost.particles[gj];
                 Vec3 dv = g.tf.pos - local[li].tf.pos;

@@ -24,6 +24,7 @@ add_library(zdem_core
     src/host/config_io.cpp
     src/host/vtk_io.cpp
     src/host/sim_build.cpp
+    src/physics/broadphase.cpp
     src/physics/pp_contact.cpp
     src/physics/wall_contact.cpp
     src/physics/integrate.cpp
