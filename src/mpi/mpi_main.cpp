@@ -270,12 +270,15 @@ int main(int argc, char** argv) {
         // positions. Output already happened above (per the plan's Global
         // Constraints: force/cc arrays are indexed by the pre-migration
         // local order). ----
-        // The halo rebuilt here is consumed only by the NEXT step's force
-        // pass; after the last step nothing reads it, so skip the final
-        // exchange (one all-rank communication saved at run end).
+        // The migration and the halo rebuilt here feed only the NEXT step's
+        // force pass; after the last step nothing reads local/ghost (rank 0
+        // prints done, then Finalize), so skip BOTH on the final step.
+        // cfg.steps comes from the same config on every rank, so the branch
+        // condition is uniform -- collective-safe (migration/exchange chain
+        // Sendrecv + Allreduce).
         const auto comm_t0 = std::chrono::steady_clock::now();
-        migrate_particles(d, local, gids);
         if (step + 1 < cfg.steps) {
+            migrate_particles(d, local, gids);
             exchange_ghosts(d, local, gids, ghost);
         }
         comm_ns += std::chrono::steady_clock::now() - comm_t0;

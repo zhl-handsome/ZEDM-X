@@ -16,11 +16,6 @@ using namespace zdem;
 // vertex), but adding the blocks back to forces[] regroups the FP evaluation
 // vs the original per-vertex direct accumulation -- gated by the
 // scratch/mpi_v0_* and scratch/pp_v0_* bit-parity baselines.
-int pp_contact_pair(const Particle& pa, const Particle& pb,
-                    const Mesh& ma, const Mesh& mb,
-                    Vec3& f_i, Vec3& t_i, Vec3& f_j, Vec3& t_j,
-                    double tangential_damping);
-
 // Cached-triangles overload: trisA/trisB are transform_tris(ma, pa.tf) /
 // transform_tris(mb, pb.tf) computed ONCE per particle per step by the
 // caller. transform_tris is a pure function of (mesh, tf) and tf is frozen

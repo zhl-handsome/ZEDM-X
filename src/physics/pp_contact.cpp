@@ -68,18 +68,6 @@ static void apply_penalty(const Vec3& wv, const Vec3& cp, double d,
 
 int pp_contact_pair(const Particle& pa, const Particle& pb,
                     const Mesh& ma, const Mesh& mb,
-                    Vec3& f_i, Vec3& t_i, Vec3& f_j, Vec3& t_j,
-                    double tangential_damping) {
-    // Named locals (not temporaries in the call): the overload takes const
-    // refs and the vectors must outlive the call.
-    std::vector<std::array<Vec3, 3>> trisA = transform_tris(ma, pa.tf);
-    std::vector<std::array<Vec3, 3>> trisB = transform_tris(mb, pb.tf);
-    return pp_contact_pair(pa, pb, ma, mb, trisA, trisB,
-                           f_i, t_i, f_j, t_j, tangential_damping);
-}
-
-int pp_contact_pair(const Particle& pa, const Particle& pb,
-                    const Mesh& ma, const Mesh& mb,
                     const std::vector<std::array<Vec3, 3>>& trisA,
                     const std::vector<std::array<Vec3, 3>>& trisB,
                     Vec3& f_i, Vec3& t_i, Vec3& f_j, Vec3& t_j,
