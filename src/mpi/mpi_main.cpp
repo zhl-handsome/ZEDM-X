@@ -109,6 +109,13 @@ int main(int argc, char** argv) {
 
     std::vector<Vec3> forces, torques;
     std::vector<int> cc;
+    // World-tris caches, hoisted out of the step loop so the per-particle
+    // buffers and their capacity survive across steps. The local/ghost set
+    // sizes change with migration + halo rebuild, so each step resizes
+    // (never shrinks capacity -> steady-state refill allocates nothing) and
+    // refills at the top of the loop, after those end-of-step phases of the
+    // previous iteration.
+    std::vector<std::vector<std::array<Vec3, 3>>> wtris_local, wtris_ghost;
     // Per-rank step timing, reset at every output step: phys_ns covers the
     // force-computation + integrate sections (world-triangle cache,
     // broadphase, pp, walls, integrate), comm_ns the migration + ghost
@@ -130,14 +137,17 @@ int main(int argc, char** argv) {
         // pp_contact_pair -- it just stops re-transforming a mesh for every
         // pair it appears in. Rebuilt after the end-of-step migration/
         // exchange so indices always match the current local/ghost arrays.
-        std::vector<std::vector<std::array<Vec3, 3>>> wtris_local(local.size());
+        // transform_tris_into refills the persistent buffers declared above
+        // the loop (values identical, no realloc in steady state).
+        wtris_local.resize(local.size());
         for (int li = 0; li < (int)local.size(); ++li) {
-            wtris_local[li] = transform_tris(sim.meshes[local[li].mesh_index], local[li].tf);
+            transform_tris_into(sim.meshes[local[li].mesh_index], local[li].tf,
+                                wtris_local[li]);
         }
-        std::vector<std::vector<std::array<Vec3, 3>>> wtris_ghost(ghost.particles.size());
+        wtris_ghost.resize(ghost.particles.size());
         for (int gj = 0; gj < (int)ghost.particles.size(); ++gj) {
-            wtris_ghost[gj] = transform_tris(sim.meshes[ghost.particles[gj].mesh_index],
-                                             ghost.particles[gj].tf);
+            transform_tris_into(sim.meshes[ghost.particles[gj].mesh_index],
+                                ghost.particles[gj].tf, wtris_ghost[gj]);
         }
 
         // ---- particle-particle (Newton off) ----

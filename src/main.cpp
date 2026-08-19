@@ -1073,6 +1073,12 @@ int main(int argc, char** argv) {
     std::vector<Vec3> torques(particles.size());
     std::vector<int> contact_counts(particles.size());
 
+    // World-tris cache, hoisted out of the step loop so the per-particle
+    // buffers and their capacity survive across steps: N is constant over a
+    // CPU run, so the per-step resize below is a no-op after step 0 and the
+    // refill allocates nothing in steady state.
+    std::vector<std::vector<std::array<Vec3, 3>>> world_tris;
+
     std::filesystem::create_directories(cfg.output_dir);
 
     for (int step = 0; step < cfg.steps; ++step) {
@@ -1096,10 +1102,12 @@ int main(int argc, char** argv) {
         // of (mesh, tf), tf is frozen between here and integration, so the
         // cached values are bit-identical to the former per-pair
         // recomputation (which did the SAME transform twice per pair when
-        // telemetry was on).
-        std::vector<std::vector<std::array<Vec3, 3>>> world_tris(particles.size());
+        // telemetry was on). transform_tris_into refills the persistent
+        // buffers declared above the loop (values identical, no realloc).
+        world_tris.resize(particles.size());
         for (int p = 0; p < static_cast<int>(particles.size()); ++p) {
-            world_tris[p] = transform_tris(meshes[particles[p].mesh_index], particles[p].tf);
+            transform_tris_into(meshes[particles[p].mesh_index], particles[p].tf,
+                                world_tris[p]);
         }
 
         // Candidate pairs from the shared spatial hash (physics/broadphase):

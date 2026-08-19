@@ -153,16 +153,22 @@ Mesh build_mesh(const std::vector<Triangle>& tris, bool center_mesh) {
     return m;
 }
 
-std::vector<Triangle> transform_tris(const Mesh& mesh, const Transform& tf) {
-    std::vector<Triangle> out;
-    out.reserve(mesh.tris.size());
-    for (const auto& tri : mesh.tris) {
+void transform_tris_into(const Mesh& mesh, const Transform& tf,
+                         std::vector<Triangle>& out) {
+    out.resize(mesh.tris.size());
+    for (std::size_t i = 0; i < mesh.tris.size(); ++i) {
+        const Triangle& tri = mesh.tris[i];
         Triangle t;
         t[0] = quat_rotate(tf.rot, tri[0]) + tf.pos;
         t[1] = quat_rotate(tf.rot, tri[1]) + tf.pos;
         t[2] = quat_rotate(tf.rot, tri[2]) + tf.pos;
-        out.push_back(t);
+        out[i] = t;
     }
+}
+
+std::vector<Triangle> transform_tris(const Mesh& mesh, const Transform& tf) {
+    std::vector<Triangle> out;
+    transform_tris_into(mesh, tf, out);
     return out;
 }
 
