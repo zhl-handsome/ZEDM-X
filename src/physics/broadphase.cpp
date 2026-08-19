@@ -2,9 +2,9 @@
 // candidate pairs (O(N^2) -> O(N) for sparse scenes). Shared by the CPU and
 // MPI drivers; see broadphase.hpp for the pair-set / order contract.
 //
-// Per-step allocations (hash map, cell vectors, out) match the drivers'
-// existing per-step world-tris caching style; keep it simple until a profile
-// says otherwise.
+// Per-step allocations (hash map, cell vectors, out) are the remaining
+// per-step heap traffic in the drivers' step loop (the world-tris buffers
+// went persistent); keep it simple until a profile says otherwise.
 #include "physics/broadphase.hpp"
 
 #include <algorithm>

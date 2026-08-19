@@ -28,7 +28,7 @@
 - 同二进制配对 A/B 计时:pile64 −11%、ff1024 −10%;**N=256 在噪声带内(−2..4%)**——本仓库规模的堆积布局稀释(256 粒子 / ~1200 cells,27 邻域扫描多为空 cell),哈希开销 ≈ 暴力扫描
 - 收益定位 **N≥10³ 起**,面向 Phase B(10⁵–10⁷);`cell = 2·max_radius·(1+2⁻³⁰)`,安全域 **<2e6 cells/轴**(超出则静默漏 pair——注释内有完整 ulp 论证)
 - 已知退化:强多粒径(cell 由 max_r 决定,大粒子+海量小粒子 → occupancy 膨胀 → 趋近 O(N²));与 GPU broadphase 同设计
-- 序保持不变量:`broadphase_pairs` 输出 = O(N²) i<j 双循环的 pair 集与字典序(距离测试操作数逐点一致);目前仅 scratch 手工字节门覆盖,**建议补 ctest 单测**(小 N 随机布点,断言与参考双循环逐元素相等)
+- 序保持不变量:`broadphase_pairs` 输出 = O(N²) i<j 双循环的 pair 集与字典序(距离测试操作数逐点一致);已 ctest 化(`tests/test_broadphase.cpp`:多布局逐元素对照参考双循环 + ghost 语义/退化/相切边界,变异验证断言有牙)
 
 ## (c) ms_max / comm_ms_max 口径
 
@@ -43,12 +43,16 @@
 
 ## 延后项(Phase B 台账)
 
-- MPI 每步 combined 数组整体拷贝 → 索引/指针视图
-- world_tris 每步 vector<vector> 分配 → arena
-- broadphase 每步 unordered_map/向量分配 → 复用
-- 末步 `migrate_particles` guard(现仅 ghost 交换有 guard;循环后无消费者,纯省一次全 rank 通信)
-- 9 参 `pp_contact_pair` 已无调用方(兼容 shim,下次动 API 时裁)
-- telemetry=1 + split_contacts=1 组合未显式门控过(门内逐字旧代码,风险近零)
+2026-08-19 晚间批次 `feat/perf-deferred-cleanup` 已落地 4 项(见 `docs/superpowers/plans/2026-08-19-perf-deferred-cleanup.md`;全部 VTK 字节级不变,MPI V1 n=2 ghost 路径同样字节 PASS):
+
+- ~~MPI 每步 combined 数组整体拷贝 → 索引/指针视图~~ ✅ `broadphase_pairs(local, ghosts*, out)` 双数组接口,组合索引视图,零拷贝
+- ~~world_tris 每步 vector<vector> 分配 → arena~~ ✅ `transform_tris_into` + 步循环外持久缓冲,稳态零分配
+- ~~末步 `migrate_particles` guard~~ ✅ 与 ghost 交换同一守卫(`step + 1 < cfg.steps`)
+- ~~9 参 `pp_contact_pair` 兼容 shim~~ ✅ 已裁,零调用方核实
+- broadphase 每步 unordered_map/向量分配 → 复用(**仍开放**;现驱动步循环内仅存的每步堆分配)
+- telemetry=1 + split_contacts=1 组合未显式门控过(**仍开放**;门内逐字旧代码,风险近零)
+
+序保持单测已 ctest 化(`tests/test_broadphase.cpp`,ctest 8/8;O(N²) 参考逐元素对照 + 变异验证 282 处断言咬合)。
 
 ## 验证基线(全部通过)
 
