@@ -59,6 +59,12 @@ add_executable(test_geometry
 target_link_libraries(test_geometry PRIVATE zdem_core)
 add_test(NAME test_geometry COMMAND test_geometry)
 
+add_executable(test_broadphase
+    tests/test_broadphase.cpp
+)
+target_link_libraries(test_broadphase PRIVATE zdem_core)
+add_test(NAME test_broadphase COMMAND test_broadphase)
+
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
     add_test(
