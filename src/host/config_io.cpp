@@ -155,6 +155,8 @@ bool parse_config_file(const std::string& path, SimConfig& cfg) {
             cfg.has_mpi_box = true;
         } else if (key == "mpi_margin") {
             iss >> cfg.mpi_margin;
+        } else if (key == "route_b_telemetry") {
+            iss >> cfg.route_b_telemetry;
         }
     }
     if (in_particle) {

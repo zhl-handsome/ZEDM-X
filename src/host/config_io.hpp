@@ -53,6 +53,7 @@ struct SimConfig {
     std::array<double, 6> mpi_box{0, 0, 0, 0, 0, 0};  // xmin xmax ymin ymax zmin zmax
     bool has_mpi_box = false;
     double mpi_margin = -1.0;   // <0 = 未设置(用默认 5*max_radius)
+    int route_b_telemetry = 0;  // 1 = run the Route-B tri-tri/loop telemetry pipeline (stdout counters only)
 };
 
 bool parse_config_file(const std::string& path, SimConfig& cfg);

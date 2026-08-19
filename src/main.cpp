@@ -1099,9 +1099,20 @@ int main(int argc, char** argv) {
                     continue;
                 }
 
-                auto t0 = std::chrono::steady_clock::now();
                 const Mesh& meshA = meshes[pa.mesh_index];
                 const Mesh& meshB = meshes[pb.mesh_index];
+                // Route-B telemetry (planes/AABB/tri-tri -> segments ->
+                // loops) feeds ONLY the stdout counters and timers of the
+                // log line below; the VTK/txt writers never consume it and
+                // the v8 contact force comes entirely from pp_contact_pair.
+                // Gated off by default: this pipeline cost ~2.9x the rest
+                // of the reference run in the 2026-08-19 scaling test.
+                // Inner indentation kept (no re-indent) so the diff is the
+                // gate alone.
+                std::vector<std::pair<Vec3, Vec3>> segments;
+                double tol = 0.0;
+                if (cfg.route_b_telemetry) {
+                auto t0 = std::chrono::steady_clock::now();
                 std::vector<std::array<Vec3, 3>> trisA = transform_tris(meshA, pa.tf);
                 std::vector<std::array<Vec3, 3>> trisB = transform_tris(meshB, pb.tf);
 
@@ -1156,12 +1167,11 @@ int main(int argc, char** argv) {
                     aabbB_max[tb] = mx;
                 }
 
-                double tol = meshA.mean_edge > 0.0 ? (meshA.mean_edge * 0.1) : (meshA.bbox_diag * 1e-2);
+                tol = meshA.mean_edge > 0.0 ? (meshA.mean_edge * 0.1) : (meshA.bbox_diag * 1e-2);
                 if (tol <= 0.0) {
                     tol = 1e-6;
                 }
 
-                std::vector<std::pair<Vec3, Vec3>> segments;
                 for (std::size_t ta = 0; ta < trisA.size(); ++ta) {
                     if (norm2(nA_all[ta]) < 1e-30) {
                         continue;
@@ -1185,6 +1195,7 @@ int main(int argc, char** argv) {
                     }
                 }
                 t_tri += std::chrono::steady_clock::now() - t0;
+                }  // route_b_telemetry tri-tri block
 
                 // ============== Containment + per-vertex penalty (v8) ==============
                 // Moved verbatim into zdem_core (physics/pp_contact.cpp) so the
@@ -1206,11 +1217,18 @@ int main(int argc, char** argv) {
                     continue;
                 }
 
+                // Loop tracing is telemetry-only; with the gate off segments
+                // stays empty by construction, but the explicit guard keeps
+                // the skip local instead of relying on that invariant.
+                if (!cfg.route_b_telemetry) {
+                    continue;
+                }
+
                 if (segments.empty()) {
                     continue;
                 }
 
-                t0 = std::chrono::steady_clock::now();
+                auto t0 = std::chrono::steady_clock::now();
                 std::vector<std::vector<int>> comps;
                 if (cfg.split_contacts) {
                     label_segments_by_contact_greedy(segments, tol, comps);
