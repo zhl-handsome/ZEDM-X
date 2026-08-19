@@ -9,6 +9,7 @@
 // Per-step semantics (wall contact_count accumulation, per-step contacts
 // counter, output condition/frame set/log line) are copied from
 // src/main.cpp.
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <string>
@@ -108,11 +109,20 @@ int main(int argc, char** argv) {
 
     std::vector<Vec3> forces, torques;
     std::vector<int> cc;
+    // Per-rank step timing, reset at every output step: phys_ns covers the
+    // force-computation + integrate sections (world-triangle cache,
+    // broadphase, pp, walls, integrate), comm_ns the migration + ghost
+    // exchange sections. Reported per output step as the per-rank MAX,
+    // averaged over the interval, so slow-rank skew (hybrid cores, load
+    // imbalance) shows up in the log.
+    std::chrono::steady_clock::duration phys_ns{}, comm_ns{};
+    int steps_since_out = 0;
     for (int step = 0; step < cfg.steps; ++step) {
         forces.assign(local.size(), Vec3{});
         torques.assign(local.size(), Vec3{});
         cc.assign(local.size(), 0);
         int total_contacts = 0;   // per-step counter, same as the CPU driver
+        const auto phys_t0 = std::chrono::steady_clock::now();
 
         // World triangles cached once per step (local + ghost copies):
         // transform_tris is pure and tf is frozen within the step, so this
@@ -215,13 +225,34 @@ int main(int argc, char** argv) {
         for (int li = 0; li < (int)local.size(); ++li) {
             integrate_particle(local[li], forces[li], torques[li], cfg.gravity, cfg.dt);
         }
+        phys_ns += std::chrono::steady_clock::now() - phys_t0;
 
         // ---- output: same condition, frame set and log fields as the CPU ----
         if (step % cfg.output_interval == 0) {
             gather_write_frame(d, cfg, sim, local, gids, cc, forces, torques, step);
             int glob_contacts = reduce_add(d, total_contacts);
+            // Per-rank timing maxima: ONE Allreduce carries both
+            // accumulators (packed as a 2-element array). Collective
+            // hygiene: every rank calls the reduce unconditionally, only
+            // the printf is rank-gated (this codebase once deadlocked on
+            // a reduce inside a rank-0 branch).
+            long long tim_in[2] = {
+                std::chrono::duration_cast<std::chrono::nanoseconds>(phys_ns).count(),
+                std::chrono::duration_cast<std::chrono::nanoseconds>(comm_ns).count()};
+            long long tim_max[2] = {0, 0};
+            MPI_Allreduce(tim_in, tim_max, 2, MPI_LONG_LONG, MPI_MAX, d.cart);
+            phys_ns = {};   // reset right after the Allreduce
+            comm_ns = {};
+            // Interval-average per-step milliseconds (integer division);
+            // step 0 has zero elapsed steps, so it reports zeros.
+            long long ms_max = 0, comm_ms_max = 0;
+            if (steps_since_out > 0) {
+                ms_max = tim_max[0] / steps_since_out / 1000000LL;
+                comm_ms_max = tim_max[1] / steps_since_out / 1000000LL;
+            }
             if (d.rank == 0) {
-                std::printf("step=%d contacts=%d\n", step, glob_contacts);
+                std::printf("step=%d contacts=%d ms_max=%lld comm_ms_max=%lld\n",
+                            step, glob_contacts, ms_max, comm_ms_max);
                 std::fflush(stdout);
             }
             // Per-output-step ownership distribution (design-spec load
@@ -230,6 +261,7 @@ int main(int argc, char** argv) {
             // between ranks after a boundary crossing.
             std::vector<int> nlocal_hint(1, (int)local.size());
             log_rank_n(d, nlocal_hint);
+            steps_since_out = 0;
         }
 
         // ---- migration + halo rebuild: particles whose centroid left its
@@ -238,13 +270,16 @@ int main(int argc, char** argv) {
         // positions. Output already happened above (per the plan's Global
         // Constraints: force/cc arrays are indexed by the pre-migration
         // local order). ----
-        migrate_particles(d, local, gids);
         // The halo rebuilt here is consumed only by the NEXT step's force
         // pass; after the last step nothing reads it, so skip the final
         // exchange (one all-rank communication saved at run end).
+        const auto comm_t0 = std::chrono::steady_clock::now();
+        migrate_particles(d, local, gids);
         if (step + 1 < cfg.steps) {
             exchange_ghosts(d, local, gids, ghost);
         }
+        comm_ns += std::chrono::steady_clock::now() - comm_t0;
+        ++steps_since_out;
     }
 
     if (d.rank == 0) {
