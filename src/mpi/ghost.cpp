@@ -8,6 +8,18 @@
 
 void exchange_ghosts(const Decomp& d, const std::vector<Particle>& local,
                      const std::vector<int>& gids, GhostLayer& out) {
+    // gids must index local 1:1: the PackedPart pairing below zips them,
+    // and every caller (initial halo + per-step rebuild after migration)
+    // maintains that invariant. A mismatch would silently ship garbage
+    // ownership tags, so die loudly instead.
+    if (gids.size() != local.size()) {
+        std::fprintf(stderr,
+                     "zdem_mpi fatal: rank %d gids/local length mismatch entering "
+                     "ghost exchange (gids=%zu local=%zu)\n",
+                     d.rank, gids.size(), local.size());
+        std::fflush(stderr);
+        MPI_Abort(d.cart, 1);
+    }
     // Chained three-axis halo exchange (LAMMPS comm_brick style). The
     // working set W starts as the locally owned particles; ghosts received
     // on axis k join W before axis k+1 is packed, so a diagonal ghost

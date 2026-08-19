@@ -220,7 +220,12 @@ int main(int argc, char** argv) {
         // Constraints: force/cc arrays are indexed by the pre-migration
         // local order). ----
         migrate_particles(d, local, gids);
-        exchange_ghosts(d, local, gids, ghost);
+        // The halo rebuilt here is consumed only by the NEXT step's force
+        // pass; after the last step nothing reads it, so skip the final
+        // exchange (one all-rank communication saved at run end).
+        if (step + 1 < cfg.steps) {
+            exchange_ghosts(d, local, gids, ghost);
+        }
     }
 
     if (d.rank == 0) {
