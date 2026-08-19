@@ -151,24 +151,21 @@ int main(int argc, char** argv) {
         }
 
         // ---- particle-particle (Newton off) ----
-        // Broadphase: one shared spatial-hash call over the combined
-        // [local; ghost] array replaces the former O(N^2) local double loop
-        // plus full ghost scan. The sorted (i, j) pair list reproduces the
-        // old per-li nesting exactly: for each local i, the local partners
-        // (j < n_local, ascending, j > i) come first, then the ghosts
-        // (j >= n_local, ascending) -- lexicographic order on the combined
-        // array IS that order. Ghost-ghost pairs (first index >= n_local)
-        // are dropped inside broadphase_pairs; the drivers never computed
-        // them. The prechecks below are bit-identical no-op copies of the
-        // test already applied inside broadphase_pairs (kept conservative
-        // per the task brief).
-        std::vector<Particle> all;
-        all.reserve(local.size() + ghost.particles.size());
-        all.insert(all.end(), local.begin(), local.end());
-        all.insert(all.end(), ghost.particles.begin(), ghost.particles.end());
+        // Broadphase: one shared spatial-hash call over the two arrays
+        // (local + halo) replaces the former O(N^2) local double loop plus
+        // full ghost scan, with no per-step combined copy. Pair indices are
+        // COMBINED (ghost j -> n_local + gj); the sorted (i, j) list
+        // reproduces the old per-li nesting exactly: for each local i, the
+        // local partners (j < n_local, ascending, j > i) come first, then
+        // the ghosts (j >= n_local, ascending) -- lexicographic order on
+        // the combined indexing IS that order. Ghost-ghost pairs are
+        // structurally never emitted (the scan only runs local i); the
+        // drivers never computed them. The prechecks below are bit-identical
+        // no-op copies of the test already applied inside broadphase_pairs
+        // (kept conservative per the task brief).
         const int n_local = (int)local.size();
         std::vector<std::pair<int, int>> pp_pairs;
-        broadphase_pairs(all, n_local, pp_pairs);
+        broadphase_pairs(local, &ghost.particles, pp_pairs);
         for (const auto& [li, lj] : pp_pairs) {
             if (lj < n_local) {
                 // Local pair: same i<j order, bounding-sphere prefilter and

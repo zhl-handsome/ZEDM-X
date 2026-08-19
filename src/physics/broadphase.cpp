@@ -35,19 +35,24 @@ struct CellKeyHash {
     }
 };
 
-inline double coord_of(const Particle& p, int axis) {
-    return axis == 0 ? p.tf.pos.x : (axis == 1 ? p.tf.pos.y : p.tf.pos.z);
-}
-
 }  // namespace
 
-void broadphase_pairs(const std::vector<Particle>& ps, int n_local,
+void broadphase_pairs(const std::vector<Particle>& local,
+                      const std::vector<Particle>* ghosts,
                       std::vector<std::pair<int, int>>& out) {
     out.clear();
-    const int n = (int)ps.size();
+    const int n_local = (int)local.size();
+    const int n = n_local + (ghosts ? (int)ghosts->size() : 0);
     if (n < 2) {
         return;
     }
+    // Combined-index view: j < n_local addresses local[j], else the ghost
+    // (*ghosts)[j - n_local]. Iterating 0..n below therefore enumerates the
+    // SAME combined sequence the drivers' former [local; ghosts] copy had.
+    const auto p_at = [&](int j) -> const Particle& {
+        return j < n_local ? local[(std::size_t)j]
+                           : (*ghosts)[(std::size_t)(j - n_local)];
+    };
 
     // Cell edge. Coverage needs cell >= r_i + r_j for every pair, i.e.
     // cell >= 2*max_radius. The (1 + 2^-30) margin makes that argument
@@ -65,7 +70,7 @@ void broadphase_pairs(const std::vector<Particle>& ps, int n_local,
     // would miss it.
     double max_radius = 0.0;
     for (int i = 0; i < n; ++i) {
-        max_radius = std::max(max_radius, ps[i].radius);
+        max_radius = std::max(max_radius, p_at(i).radius);
     }
     const double cell = 2.0 * max_radius * (1.0 + 1.0 / 1073741824.0);
     if (!(cell > 0.0)) {
@@ -74,29 +79,35 @@ void broadphase_pairs(const std::vector<Particle>& ps, int n_local,
         return;
     }
 
-    // Grid reference corner = min position over ps. Indexing against min
-    // keeps every (coord - lo) >= 0 and std::floor behaves plainly; casting
-    // negative values to long long would truncate toward zero instead.
+    // Grid reference corner = min position over the combined set. Indexing
+    // against min keeps every (coord - lo) >= 0 and std::floor behaves
+    // plainly; casting negative values to long long would truncate toward
+    // zero instead.
     double lo[3];
     for (int a = 0; a < 3; ++a) {
-        lo[a] = coord_of(ps[0], a);
+        lo[a] = a == 0 ? p_at(0).tf.pos.x : (a == 1 ? p_at(0).tf.pos.y
+                                                   : p_at(0).tf.pos.z);
     }
     for (int i = 1; i < n; ++i) {
-        for (int a = 0; a < 3; ++a) {
-            lo[a] = std::min(lo[a], coord_of(ps[i], a));
-        }
+        const Vec3& p = p_at(i).tf.pos;
+        lo[0] = std::min(lo[0], p.x);
+        lo[1] = std::min(lo[1], p.y);
+        lo[2] = std::min(lo[2], p.z);
     }
 
     // Bucket every particle into its cell; cell_of caches each particle's
-    // own key so the neighbor scan below does not recompute it.
+    // own key so the neighbor scan below does not recompute it. Local
+    // particles are inserted first (combined indices 0..n_local), then the
+    // ghosts -- the same sequence the former combined array carried.
     std::unordered_map<CellKey, std::vector<int>, CellKeyHash> grid;
     grid.reserve((std::size_t)n * 2);
     std::vector<CellKey> cell_of((std::size_t)n);
     for (int i = 0; i < n; ++i) {
+        const Vec3& pos = p_at(i).tf.pos;
         CellKey k;
-        for (int a = 0; a < 3; ++a) {
-            k.c[a] = (long long)std::floor((coord_of(ps[i], a) - lo[a]) / cell);
-        }
+        k.c[0] = (long long)std::floor((pos.x - lo[0]) / cell);
+        k.c[1] = (long long)std::floor((pos.y - lo[1]) / cell);
+        k.c[2] = (long long)std::floor((pos.z - lo[2]) / cell);
         grid[k].push_back(i);
         cell_of[(std::size_t)i] = k;
     }
@@ -107,8 +118,12 @@ void broadphase_pairs(const std::vector<Particle>& ps, int n_local,
     // the drivers' former in-loop precheck -- same operands, same expression
     // order -- so the collected set equals the O(N^2) i<j double loop's set
     // exactly (the precheck kept in the MPI consumer is a no-op copy of it).
+    // The loop covers only local i, so ghost-ghost pairs (both indices >=
+    // n_local) are structurally absent, as in the drivers.
     for (int i = 0; i < n_local; ++i) {
         const CellKey& ki = cell_of[(std::size_t)i];
+        const Vec3& pi = p_at(i).tf.pos;
+        const double ri = p_at(i).radius;
         for (int dx = -1; dx <= 1; ++dx) {
             for (int dy = -1; dy <= 1; ++dy) {
                 for (int dz = -1; dz <= 1; ++dz) {
@@ -124,8 +139,8 @@ void broadphase_pairs(const std::vector<Particle>& ps, int n_local,
                         if (j <= i) {
                             continue;
                         }
-                        Vec3 dpos = ps[(std::size_t)j].tf.pos - ps[(std::size_t)i].tf.pos;
-                        double rsum = ps[(std::size_t)i].radius + ps[(std::size_t)j].radius;
+                        Vec3 dpos = p_at(j).tf.pos - pi;
+                        double rsum = ri + p_at(j).radius;
                         if (dot(dpos, dpos) > rsum * rsum) {
                             continue;
                         }

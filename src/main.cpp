@@ -1111,14 +1111,14 @@ int main(int argc, char** argv) {
         }
 
         // Candidate pairs from the shared spatial hash (physics/broadphase):
-        // replaces the former O(N^2) i<j bounding-sphere double loop.
-        // broadphase_pairs returns exactly the pairs that passed the old
-        // in-loop precheck (bit-identical distance test) in the same
-        // lexicographic (i, j) order, so the loop body below sees identical
-        // inputs in an identical sequence -- VTK output stays byte-level
-        // unchanged.
+        // replaces the former O(N^2) i<j bounding-sphere double loop. The
+        // CPU driver has no halo, so ghosts = nullptr. broadphase_pairs
+        // returns exactly the pairs that passed the old in-loop precheck
+        // (bit-identical distance test) in the same lexicographic (i, j)
+        // order, so the loop body below sees identical inputs in an
+        // identical sequence -- VTK output stays byte-level unchanged.
         std::vector<std::pair<int, int>> pp_pairs;
-        broadphase_pairs(particles, static_cast<int>(particles.size()), pp_pairs);
+        broadphase_pairs(particles, nullptr, pp_pairs);
 
         for (const auto& [i, j] : pp_pairs) {
                 Particle& pa = particles[i];
