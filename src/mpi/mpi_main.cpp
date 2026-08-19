@@ -18,6 +18,7 @@
 
 #include "host/config_io.hpp"
 #include "host/sim_build.hpp"
+#include "geometry/mesh_build.hpp"
 #include "mpi/decomp.hpp"
 #include "mpi/gather.hpp"
 #include "mpi/ghost.hpp"
@@ -112,6 +113,22 @@ int main(int argc, char** argv) {
         cc.assign(local.size(), 0);
         int total_contacts = 0;   // per-step counter, same as the CPU driver
 
+        // World triangles cached once per step (local + ghost copies):
+        // transform_tris is pure and tf is frozen within the step, so this
+        // is bit-identical to the per-pair recomputation inside
+        // pp_contact_pair -- it just stops re-transforming a mesh for every
+        // pair it appears in. Rebuilt after the end-of-step migration/
+        // exchange so indices always match the current local/ghost arrays.
+        std::vector<std::vector<std::array<Vec3, 3>>> wtris_local(local.size());
+        for (int li = 0; li < (int)local.size(); ++li) {
+            wtris_local[li] = transform_tris(sim.meshes[local[li].mesh_index], local[li].tf);
+        }
+        std::vector<std::vector<std::array<Vec3, 3>>> wtris_ghost(ghost.particles.size());
+        for (int gj = 0; gj < (int)ghost.particles.size(); ++gj) {
+            wtris_ghost[gj] = transform_tris(sim.meshes[ghost.particles[gj].mesh_index],
+                                             ghost.particles[gj].tf);
+        }
+
         // ---- particle-particle (Newton off) ----
         for (int li = 0; li < (int)local.size(); ++li) {
             // Local pairs: same i<j order, bounding-sphere prefilter and
@@ -127,6 +144,7 @@ int main(int argc, char** argv) {
                 if (pp_contact_pair(local[li], local[lj],
                                     sim.meshes[local[li].mesh_index],
                                     sim.meshes[local[lj].mesh_index],
+                                    wtris_local[li], wtris_local[lj],
                                     f_i, t_i, f_j, t_j,
                                     cfg.tangential_damping) > 0) {
                     forces[li] += f_i; torques[li] += t_i;
@@ -149,6 +167,7 @@ int main(int argc, char** argv) {
                 if (pp_contact_pair(local[li], g,
                                     sim.meshes[local[li].mesh_index],
                                     sim.meshes[g.mesh_index],
+                                    wtris_local[li], wtris_ghost[gj],
                                     f_i, t_i, f_j, t_j,
                                     cfg.tangential_damping) > 0) {
                     forces[li] += f_i; torques[li] += t_i;

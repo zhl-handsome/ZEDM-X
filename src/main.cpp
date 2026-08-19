@@ -1088,6 +1088,19 @@ int main(int argc, char** argv) {
         auto t_tri = std::chrono::steady_clock::duration::zero();
         auto t_rebuild = std::chrono::steady_clock::duration::zero();
         auto t_output = std::chrono::steady_clock::duration::zero();
+
+        // World-space triangles per particle, computed once per step and
+        // shared by the (optional) telemetry block and pp_contact_pair
+        // below. Pure-function hoisting: transform_tris is a pure function
+        // of (mesh, tf), tf is frozen between here and integration, so the
+        // cached values are bit-identical to the former per-pair
+        // recomputation (which did the SAME transform twice per pair when
+        // telemetry was on).
+        std::vector<std::vector<std::array<Vec3, 3>>> world_tris(particles.size());
+        for (int p = 0; p < static_cast<int>(particles.size()); ++p) {
+            world_tris[p] = transform_tris(meshes[particles[p].mesh_index], particles[p].tf);
+        }
+
     for (int i = 0; i < static_cast<int>(particles.size()); ++i) {
         for (int j = i + 1; j < static_cast<int>(particles.size()); ++j) {
                 Particle& pa = particles[i];
@@ -1113,8 +1126,8 @@ int main(int argc, char** argv) {
                 double tol = 0.0;
                 if (cfg.route_b_telemetry) {
                 auto t0 = std::chrono::steady_clock::now();
-                std::vector<std::array<Vec3, 3>> trisA = transform_tris(meshA, pa.tf);
-                std::vector<std::array<Vec3, 3>> trisB = transform_tris(meshB, pb.tf);
+                const std::vector<std::array<Vec3, 3>>& trisA = world_tris[i];
+                const std::vector<std::array<Vec3, 3>>& trisB = world_tris[j];
 
                 std::vector<Vec3> nA_all(trisA.size());
                 std::vector<Vec3> nB_all(trisB.size());
@@ -1206,6 +1219,7 @@ int main(int argc, char** argv) {
                 // binary is gated by scratch/mpi_v0_* and scratch/pp_v0_*.
                 Vec3 f_i, t_i, f_j, t_j;
                 int n_inc = pp_contact_pair(pa, pb, meshA, meshB,
+                                            world_tris[i], world_tris[j],
                                             f_i, t_i, f_j, t_j, cfg.tangential_damping);
                 if (n_inc > 0) {
                     forces[i] += f_i; torques[i] += t_i;      // Block sums: f_i/f_j keep the original per-vertex
