@@ -52,14 +52,17 @@ void broadphase_pairs(const std::vector<Particle>& ps, int n_local,
     // Cell edge. Coverage needs cell >= r_i + r_j for every pair, i.e.
     // cell >= 2*max_radius. The (1 + 2^-30) margin makes that argument
     // airtight in floating point: cell indices are
-    // floor((pos - lo) / cell), and each computed quotient carries at most
-    // ~2 ulps of rounding (subtraction + division) versus the exact one, so
-    // two centers less than 2*max_radius apart get indices differing by at
-    // most 1 per axis as long as the domain spans well under ~1e9 cells
-    // (this repo: 256 particles over ~14 cells). With a bare 2*max_radius
-    // cell there is a sub-ulp-wide window where the quotients of a touching
-    // pair could straddle two integer boundaries each and the
-    // 27-neighborhood scan would miss it.
+    // floor((pos - lo) / cell), and each computed quotient q carries at
+    // most ~2 ulps of rounding (subtraction + division) versus the exact
+    // one -- an absolute error of about |q|*2^-51 per quotient -- so two
+    // centers less than 2*max_radius apart get indices differing by at
+    // most 1 per axis as long as the domain stays under ~2e6 cells per
+    // axis (|q| < 2^21 keeps 2*|q|*2^-52 below the 2^-30 slack; this
+    // repo: 256 particles over ~14 cells). Beyond that bound pairs could
+    // be silently missed. With a bare 2*max_radius cell there is also a
+    // sub-ulp-wide window where the quotients of a touching pair could
+    // straddle two integer boundaries each and the 27-neighborhood scan
+    // would miss it.
     double max_radius = 0.0;
     for (int i = 0; i < n; ++i) {
         max_radius = std::max(max_radius, ps[i].radius);
